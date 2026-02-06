@@ -5,11 +5,7 @@ Contains event handlers and helper functions related to result display, scoring,
 import os
 import json
 import datetime
-import math
 import re
-import tempfile
-import shutil
-import zipfile
 import time as time_module
 import sys
 from typing import Dict, Any, Optional, List
@@ -25,7 +21,7 @@ from acestep.gpu_config import (
     check_batch_size_limit,
 )
 
-# Platform detection for Windows-specific fixes
+# Platform detection for Windows-specific fixess
 IS_WINDOWS = sys.platform == "win32"
 
 # Global results directory inside project root
