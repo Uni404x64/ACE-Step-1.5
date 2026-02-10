@@ -3126,6 +3126,25 @@ class AceStepHandler:
         """Core tiled decode logic (extracted for fallback wrapping)."""
         B, C, T = latents.shape
         
+        # ---- Batch-sequential decode ----
+        # VAE decode VRAM scales linearly with batch size.  On tight-VRAM GPUs
+        # (e.g. 8 GB) decoding the whole batch at once can OOM.  Process one
+        # sample at a time so peak VRAM stays constant regardless of batch size.
+        if B > 1:
+            logger.info(f"[tiled_decode] Batch size {B} > 1 — decoding samples sequentially to save VRAM")
+            per_sample_results = []
+            for b_idx in range(B):
+                single = latents[b_idx : b_idx + 1]  # [1, C, T]
+                decoded = self._tiled_decode_inner(single, chunk_size, overlap, offload_wav_to_cpu)
+                # Move to CPU immediately to free GPU VRAM for next sample
+                per_sample_results.append(decoded.cpu() if decoded.device.type != "cpu" else decoded)
+                self._empty_cache()
+            # Concatenate on CPU then move back if needed
+            result = torch.cat(per_sample_results, dim=0)  # [B, channels, samples]
+            if latents.device.type != "cpu" and not offload_wav_to_cpu:
+                result = result.to(latents.device)
+            return result
+        
         # Adjust overlap for very small chunk sizes to ensure positive stride
         effective_overlap = overlap
         while chunk_size - 2 * effective_overlap <= 0 and effective_overlap > 0:
