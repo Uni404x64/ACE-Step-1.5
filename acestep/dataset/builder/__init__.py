@@ -1,1 +1,1 @@
-"""Data builder package intent: offline dataset scanning, preprocessing, and serialization."""
+"""Dataset builder package intent: offline dataset scanning, preprocessing, and serialization."""

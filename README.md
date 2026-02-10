@@ -185,6 +185,11 @@ See the **LoRA Training** tab in Gradio UI for one-click training, or check [Gra
     <img src="./assets/ACE-Step_framework.png" width="100%" alt="ACE-Step Framework">
 </p>
 
+### Package Layout Notes
+
+- `acestep.*` directories are explicit Python packages used for internal code decomposition and stable imports.
+- Top-level `ui/` is static frontend asset content; Python UI modules live under `acestep/ui/`.
+
 ## 🦁 Model Zoo
 
 <p align="center">
