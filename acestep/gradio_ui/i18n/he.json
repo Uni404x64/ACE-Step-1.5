@@ -59,7 +59,10 @@
     "init_btn": "אתחול שירות",
     "status_label": "מצב",
     "language_label": "שפת ממשק",
-    "language_info": "בחר את שפת הממשק"
+    "language_info": "בחר את שפת הממשק",
+    "gpu_auto_tier": "שכבה שזוהתה אוטומטית",
+    "tier_label": "דריסת שכבת GPU",
+    "tier_info": "בחר שכבת GPU באופן ידני כדי להתאים ברירות מחדל של אופטימיזציה (העברה, קוונטיזציה, מנוע וכו')"
   },
   "generation": {
     "required_inputs": "📝 קלטים נדרשים",

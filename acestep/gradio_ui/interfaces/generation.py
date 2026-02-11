@@ -13,7 +13,7 @@ from acestep.constants import (
 )
 from acestep.gradio_ui.i18n import t
 from acestep.gradio_ui.events.generation_handlers import get_ui_control_config
-from acestep.gpu_config import get_global_gpu_config, GPUConfig, is_lm_model_size_allowed, find_best_lm_model_on_disk
+from acestep.gpu_config import get_global_gpu_config, GPUConfig, is_lm_model_size_allowed, find_best_lm_model_on_disk, get_gpu_device_name, GPU_TIER_LABELS, GPU_TIER_CHOICES
 
 
 def create_generation_section(dit_handler, llm_handler, init_params=None, language='en') -> dict:
@@ -98,6 +98,20 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
                     value=current_language,
                     label=t("service.language_label"),
                     info=t("service.language_info"),
+                    scale=1,
+                )
+            
+            # GPU info display and tier override
+            _gpu_device_name = get_gpu_device_name()
+            _gpu_info_text = f"🖥️ **{_gpu_device_name}** — {gpu_config.gpu_memory_gb:.1f} GB VRAM — {t('service.gpu_auto_tier')}: **{GPU_TIER_LABELS.get(gpu_config.tier, gpu_config.tier)}**"
+            with gr.Row():
+                gpu_info_display = gr.Markdown(value=_gpu_info_text)
+            with gr.Row():
+                tier_dropdown = gr.Dropdown(
+                    choices=[(label, key) for key, label in GPU_TIER_LABELS.items()],
+                    value=gpu_config.tier,
+                    label=t("service.tier_label"),
+                    info=t("service.tier_info"),
                     scale=1,
                 )
             
@@ -874,4 +888,7 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
         "gpu_config": gpu_config,
         "max_duration": max_duration,
         "max_batch_size": max_batch_size,
+        # GPU info and tier override
+        "gpu_info_display": gpu_info_display,
+        "tier_dropdown": tier_dropdown,
     }

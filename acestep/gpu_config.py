@@ -111,7 +111,7 @@ class GPUConfig:
     recommended_lm_model: str  # Recommended default LM model path (empty if LM not available)
     
     # LM backend restriction
-    # "all" = any backend, "pt_mlx_only" = only pt/mlx (no vllm), used for very low VRAM
+    # "all" = any backend, "pt_mlx_only" = only pt/mlx (no vllm), used for MPS (vllm requires CUDA)
     lm_backend_restriction: str  # "all" or "pt_mlx_only"
     recommended_backend: str  # Recommended default backend: "vllm", "pt", or "mlx"
     
@@ -142,8 +142,8 @@ GPU_TIER_CONFIGS = {
         "init_lm_default": False,
         "available_lm_models": [],
         "recommended_lm_model": "",
-        "lm_backend_restriction": "pt_mlx_only",  # vllm KV cache won't fit
-        "recommended_backend": "pt",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
         "offload_to_cpu_default": True,
         "offload_dit_to_cpu_default": True,
         "quantization_default": True,  # INT8 essential to fit DiT in ~4GB
@@ -161,8 +161,8 @@ GPU_TIER_CONFIGS = {
         "init_lm_default": False,
         "available_lm_models": [],
         "recommended_lm_model": "",
-        "lm_backend_restriction": "pt_mlx_only",
-        "recommended_backend": "pt",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
         "offload_to_cpu_default": True,
         "offload_dit_to_cpu_default": True,
         "quantization_default": True,
@@ -172,7 +172,7 @@ GPU_TIER_CONFIGS = {
     "tier3": {  # 6-8GB
         # Offload mode.  DiT(4.46) + context(0.5) ≈ 5.0GB.
         # ~1.5-3GB headroom allows LM 0.6B (1.2+0.6=1.8GB) and batch=2.
-        # vllm KV cache is tight; pt backend is safer for 0.6B on this tier.
+        # With CPU offload, DiT is offloaded before LM runs → vllm can use freed VRAM.
         "max_duration_with_lm": 480,  # 8 minutes
         "max_duration_without_lm": 600,  # 10 minutes (max supported)
         "max_batch_size_with_lm": 2,
@@ -180,8 +180,8 @@ GPU_TIER_CONFIGS = {
         "init_lm_default": True,
         "available_lm_models": ["acestep-5Hz-lm-0.6B"],
         "recommended_lm_model": "acestep-5Hz-lm-0.6B",
-        "lm_backend_restriction": "pt_mlx_only",  # vllm KV cache too greedy for <8GB
-        "recommended_backend": "pt",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
         "offload_to_cpu_default": True,
         "offload_dit_to_cpu_default": True,
         "quantization_default": True,
@@ -1078,6 +1078,97 @@ def print_gpu_config_info(gpu_config: GPUConfig):
     logger.info(f"  - Max Batch Size (without LM): {gpu_config.max_batch_size_without_lm}")
     logger.info(f"  - Init LM by Default: {gpu_config.init_lm_default}")
     logger.info(f"  - Available LM Models: {gpu_config.available_lm_models or 'None'}")
+
+
+# Human-readable tier labels for UI display
+GPU_TIER_LABELS = {
+    "tier1": "tier1 (≤4GB)",
+    "tier2": "tier2 (4-6GB)",
+    "tier3": "tier3 (6-8GB)",
+    "tier4": "tier4 (8-12GB)",
+    "tier5": "tier5 (12-16GB)",
+    "tier6a": "tier6a (16-20GB)",
+    "tier6b": "tier6b (20-24GB)",
+    "unlimited": "unlimited (≥24GB)",
+}
+
+# Ordered list of tier keys for dropdown
+GPU_TIER_CHOICES = list(GPU_TIER_LABELS.items())  # [(value, label), ...]
+
+
+def get_gpu_device_name() -> str:
+    """
+    Get the GPU device name string.
+    
+    Returns:
+        Human-readable GPU name, e.g. "NVIDIA GeForce RTX 4060 Ti",
+        "Apple M2 Pro (MPS)", "CPU only", etc.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            props = torch.xpu.get_device_properties(0)
+            return getattr(props, 'name', 'Intel XPU')
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # MPS doesn't expose a device name; use platform info
+            try:
+                import platform
+                chip = platform.processor() or "Apple Silicon"
+                return f"{chip} (MPS)"
+            except Exception:
+                return "Apple Silicon (MPS)"
+        else:
+            return "CPU only"
+    except ImportError:
+        return "Unknown (PyTorch not available)"
+
+
+def get_gpu_config_for_tier(tier: str) -> GPUConfig:
+    """
+    Create a GPUConfig for a specific tier, applying platform overrides.
+    
+    This is used when the user manually selects a different tier in the UI.
+    The actual gpu_memory_gb is preserved from the real hardware detection,
+    but all tier-based settings come from the selected tier's config.
+    
+    Args:
+        tier: Tier key, e.g. "tier3", "tier6a", "unlimited"
+        
+    Returns:
+        GPUConfig with the selected tier's settings
+    """
+    if tier not in GPU_TIER_CONFIGS:
+        logger.warning(f"Unknown tier '{tier}', falling back to auto-detected config")
+        return get_gpu_config()
+    
+    # Keep the real GPU memory for informational purposes
+    real_gpu_memory = get_gpu_memory_gb()
+    config = GPU_TIER_CONFIGS[tier]
+    
+    _mps = is_mps_platform()
+    if _mps:
+        logger.info(f"Manual tier override to {tier} on macOS MPS — applying Apple Silicon overrides")
+    
+    return GPUConfig(
+        tier=tier,
+        gpu_memory_gb=real_gpu_memory,
+        max_duration_with_lm=config["max_duration_with_lm"],
+        max_duration_without_lm=config["max_duration_without_lm"],
+        max_batch_size_with_lm=config["max_batch_size_with_lm"],
+        max_batch_size_without_lm=config["max_batch_size_without_lm"],
+        init_lm_default=config["init_lm_default"],
+        available_lm_models=config["available_lm_models"],
+        recommended_lm_model=config.get("recommended_lm_model", ""),
+        lm_backend_restriction="pt_mlx_only" if _mps else config.get("lm_backend_restriction", "all"),
+        recommended_backend="mlx" if _mps else config.get("recommended_backend", "vllm"),
+        offload_to_cpu_default=False if _mps else config.get("offload_to_cpu_default", True),
+        offload_dit_to_cpu_default=False if _mps else config.get("offload_dit_to_cpu_default", True),
+        quantization_default=False if _mps else config.get("quantization_default", True),
+        compile_model_default=False if _mps else config.get("compile_model_default", True),
+        lm_memory_gb=config["lm_memory_gb"],
+    )
 
 
 # Global GPU config instance (initialized lazily)

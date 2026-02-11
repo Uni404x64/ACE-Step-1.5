@@ -59,7 +59,10 @@
     "init_btn": "サービスを初期化",
     "status_label": "ステータス",
     "language_label": "UI言語",
-    "language_info": "インターフェース言語を選択"
+    "language_info": "インターフェース言語を選択",
+    "gpu_auto_tier": "自動検出ティア",
+    "tier_label": "GPU ティアの手動選択",
+    "tier_info": "GPUティアを手動で選択して最適化のデフォルト（オフロード、量子化、バックエンドなど）を調整します"
   },
   "generation": {
     "required_inputs": "📝 必須入力",

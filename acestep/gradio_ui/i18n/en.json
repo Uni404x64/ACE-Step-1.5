@@ -59,7 +59,10 @@
     "init_btn": "Initialize Service",
     "status_label": "Status",
     "language_label": "UI Language",
-    "language_info": "Select interface language"
+    "language_info": "Select interface language",
+    "gpu_auto_tier": "Auto-detected tier",
+    "tier_label": "GPU Tier Override",
+    "tier_info": "Manually select a GPU tier to adjust optimization defaults (offload, quantization, backend, etc.)"
   },
   "generation": {
     "required_inputs": "📝 Required Inputs",

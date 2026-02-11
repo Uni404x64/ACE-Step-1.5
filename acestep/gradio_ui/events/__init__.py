@@ -43,6 +43,24 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
         ]
     )
     
+    # ========== Tier Override ==========
+    generation_section["tier_dropdown"].change(
+        fn=lambda tier: gen_h.on_tier_change(tier, llm_handler),
+        inputs=[generation_section["tier_dropdown"]],
+        outputs=[
+            generation_section["offload_to_cpu_checkbox"],
+            generation_section["offload_dit_to_cpu_checkbox"],
+            generation_section["compile_model_checkbox"],
+            generation_section["quantization_checkbox"],
+            generation_section["backend_dropdown"],
+            generation_section["lm_model_path"],
+            generation_section["init_llm_checkbox"],
+            generation_section["batch_size_input"],
+            generation_section["audio_duration"],
+            generation_section["gpu_info_display"],
+        ]
+    )
+    
     generation_section["init_btn"].click(
         fn=lambda *args: gen_h.init_service_wrapper(dit_handler, llm_handler, *args),
         inputs=[
