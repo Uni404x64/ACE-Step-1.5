@@ -375,6 +375,7 @@ PARAM_ALIASES = {
     "use_cot_language": ["use_cot_language", "cot_language", "cot-language"],
     "is_format_caption": ["is_format_caption", "isFormatCaption"],
     "allow_lm_batch": ["allow_lm_batch", "allowLmBatch", "parallel_thinking"],
+    "track_name": ["track_name", "trackName"],
 }
 
 
@@ -520,6 +521,7 @@ class GenerateMusicRequest(BaseModel):
     use_cot_language: bool = True
     is_format_caption: bool = False
     allow_lm_batch: bool = True
+    track_name: Optional[str] = None
 
     lm_temperature: float = 0.85
     lm_cfg_scale: float = 2.5
@@ -1513,7 +1515,14 @@ def create_app() -> FastAPI:
                 # This matches gradio behavior which uses TASK_INSTRUCTIONS for each task type
                 instruction_to_use = req.instruction
                 if instruction_to_use == DEFAULT_DIT_INSTRUCTION and req.task_type in TASK_INSTRUCTIONS:
-                    instruction_to_use = TASK_INSTRUCTIONS[req.task_type]
+                    raw_instruction = TASK_INSTRUCTIONS[req.task_type]
+                    if "{TRACK_NAME}" in raw_instruction and req.track_name:
+                        instruction_to_use = raw_instruction.format(TRACK_NAME=req.track_name.upper())
+                    elif "{TRACK_CLASSES}" in raw_instruction:
+                         # Handle 'complete' task if you use it later
+                         pass 
+                    else:
+                        instruction_to_use = raw_instruction
 
                 # Build GenerationParams using unified interface
                 # Note: thinking controls LM code generation, sample_mode only affects CoT metas
@@ -2264,6 +2273,7 @@ def create_app() -> FastAPI:
                 use_cot_language=p.bool("use_cot_language", True),
                 is_format_caption=p.bool("is_format_caption"),
                 allow_lm_batch=p.bool("allow_lm_batch", True),
+                 track_name=p.str("track_name"),
                 **kwargs,
             )
 
