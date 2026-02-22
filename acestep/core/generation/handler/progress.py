@@ -6,6 +6,15 @@ import threading
 import time
 from typing import Optional
 
+from loguru import logger
+
+# Conservative per-step wall-clock estimate used when no timing history exists
+# (i.e. first run on a fresh machine).  2.5 s/step is typical for mid-tier GPUs;
+# the value is multiplied by batch_size so larger batches get a proportionally
+# longer expected duration, keeping the progress bar from jumping to the end too
+# quickly.
+_FALLBACK_PER_STEP_SEC_PER_BATCH: float = 2.5
+
 
 class ProgressMixin:
     def _get_project_root(self) -> str:
@@ -146,7 +155,26 @@ class ProgressMixin:
         duration_sec: Optional[float],
         desc: str,
     ):
-        """Best-effort progress updates during diffusion using previous step timing."""
+        """Start a daemon thread that emits best-effort progress updates during diffusion.
+
+        Estimates expected duration from timing history or falls back to a
+        conservative constant scaled by ``batch_size``.  Returns ``(None, None)``
+        when ``progress`` is ``None`` or ``infer_steps <= 0``.
+
+        Args:
+            progress: Gradio-style progress callback, or None to skip updates.
+            start: Progress range lower bound (0-1).
+            end: Progress range upper bound (0-1).
+            infer_steps: Number of diffusion steps.
+            batch_size: Number of items in the current batch.
+            duration_sec: Target audio duration in seconds, used to refine estimates.
+            desc: Description string forwarded to the progress callback.
+
+        Returns:
+            Tuple of ``(stop_event, thread)``; call ``stop_event.set()`` to halt
+            updates and then join the thread.  Returns ``(None, None)`` when
+            updates cannot be started.
+        """
         if progress is None or infer_steps <= 0:
             return None, None
         per_step = self._estimate_diffusion_per_step(
@@ -155,7 +183,13 @@ class ProgressMixin:
             duration_sec=duration_sec,
         ) or self._last_diffusion_per_step_sec
         if not per_step or per_step <= 0:
-            return None, None
+            per_step = _FALLBACK_PER_STEP_SEC_PER_BATCH * max(1, batch_size)
+            logger.debug(
+                "[progress] No timing history available; using conservative cold-start "
+                "fallback of {:.1f}s/step (batch_size={}).",
+                per_step,
+                batch_size,
+            )
         expected = per_step * infer_steps
         if expected <= 0:
             return None, None
