@@ -43,6 +43,7 @@
     "backend_info": "选择5Hz LM的后端: vllm(更快)或pt(PyTorch, 更兼容)。",
     "init_llm_label": "初始化 5Hz LM",
     "init_llm_info": "勾选以在服务初始化期间初始化5Hz LM。",
+    "lm_unavailable_vram": "⚠️ 当前GPU档位不支持LM（显存不足）",
     "flash_attention_label": "使用Flash Attention",
     "flash_attention_info_enabled": "启用flash attention以加快推理速度(需要flash_attn包)",
     "flash_attention_info_disabled": "Flash attention不可用(未安装flash_attn包)",

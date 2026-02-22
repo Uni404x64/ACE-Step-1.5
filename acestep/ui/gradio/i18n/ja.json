@@ -43,6 +43,7 @@
     "backend_info": "5Hz LMのバックエンドを選択: vllm(高速)またはpt(PyTorch、より互換性あり)。",
     "init_llm_label": "5Hz LM を初期化",
     "init_llm_info": "サービス初期化中に5Hz LMを初期化する場合はチェック。",
+    "lm_unavailable_vram": "⚠️ このGPUティアではLMを利用できません（VRAM不足）",
     "flash_attention_label": "Flash Attention を使用",
     "flash_attention_info_enabled": "推論を高速化するためにflash attentionを有効にする(flash_attnパッケージが必要)",
     "flash_attention_info_disabled": "Flash attentionは利用できません(flash_attnパッケージがインストールされていません)",
