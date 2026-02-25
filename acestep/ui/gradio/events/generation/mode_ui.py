@@ -74,7 +74,9 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
     elif not lm_initialized:
         think_update = gr.update(interactive=False, value=False, visible=True)
     else:
-        think_update = gr.update(interactive=True, visible=True)
+        # Restore thinking to True when entering a mode where it is supported
+        # (e.g. Custom after returning from Remix/Repaint where it was forced off).
+        think_update = gr.update(interactive=True, visible=True, value=True)
 
     mode_descriptions = {
         "Simple": t("generation.mode_info_simple"),
