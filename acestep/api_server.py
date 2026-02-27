@@ -68,6 +68,10 @@ from acestep.api.jobs.local_cache_updates import (
     update_local_cache,
     update_local_cache_progress,
 )
+from acestep.api.jobs.worker_loops import (
+    process_queue_item,
+    run_job_store_cleanup_loop,
+)
 
 from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
@@ -1805,52 +1809,21 @@ def create_app() -> FastAPI:
         async def _queue_worker(worker_idx: int) -> None:
             while True:
                 job_id, req = await app.state.job_queue.get()
-                rec = store.get(job_id)
-                try:
-                    async with app.state.pending_lock:
-                        try:
-                            app.state.pending_ids.remove(job_id)
-                        except ValueError:
-                            pass
-
-                    await _run_one_job(job_id, req)
-
-                    # Notify OpenRouter waiters after job completion
-                    if rec and rec.progress_queue:
-                        if rec.status == "succeeded" and rec.result:
-                            await rec.progress_queue.put({"type": "result", "result": rec.result})
-                        elif rec.status == "failed":
-                            await rec.progress_queue.put({"type": "error", "content": rec.error or "Generation failed"})
-                        await rec.progress_queue.put({"type": "done"})
-                    if rec and rec.done_event:
-                        rec.done_event.set()
-
-                except Exception as exc:
-                    # _run_one_job raised (e.g. _ensure_initialized failed)
-                    if rec and rec.status not in ("succeeded", "failed"):
-                        store.mark_failed(job_id, str(exc))
-                    if rec and rec.progress_queue:
-                        await rec.progress_queue.put({"type": "error", "content": str(exc)})
-                        await rec.progress_queue.put({"type": "done"})
-                    if rec and rec.done_event:
-                        rec.done_event.set()
-                finally:
-                    await _cleanup_job_temp_files(job_id)
-                    app.state.job_queue.task_done()
+                await process_queue_item(
+                    job_id=job_id,
+                    req=req,
+                    app_state=app.state,
+                    store=store,
+                    run_one_job=_run_one_job,
+                    cleanup_job_temp_files=_cleanup_job_temp_files,
+                )
 
         async def _job_store_cleanup_worker() -> None:
             """Background task to periodically clean up old completed jobs."""
-            while True:
-                try:
-                    await asyncio.sleep(JOB_STORE_CLEANUP_INTERVAL)
-                    removed = store.cleanup_old_jobs()
-                    if removed > 0:
-                        stats = store.get_stats()
-                        print(f"[API Server] Cleaned up {removed} old jobs. Current stats: {stats}")
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    print(f"[API Server] Job cleanup error: {e}")
+            await run_job_store_cleanup_loop(
+                store=store,
+                cleanup_interval_seconds=JOB_STORE_CLEANUP_INTERVAL,
+            )
 
         worker_count = max(1, WORKER_COUNT)
         workers = [asyncio.create_task(_queue_worker(i)) for i in range(worker_count)]
