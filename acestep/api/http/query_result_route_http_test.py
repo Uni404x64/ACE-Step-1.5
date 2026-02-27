@@ -162,6 +162,22 @@ class QueryResultRouteHttpTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([], payload["data"])
 
+    def test_query_result_preserves_non_list_json_task_id_iteration(self):
+        """POST /query_result should keep legacy iteration behavior for parsed non-list JSON payloads."""
+
+        client = self._build_client()
+        response = client.post(
+            "/query_result",
+            json={"ai_token": "test-token", "task_id_list": '{"task-a": 1, "task-b": 2}'},
+        )
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(2, len(payload["data"]))
+        self.assertEqual("task-a", payload["data"][0]["task_id"])
+        self.assertEqual("task-b", payload["data"][1]["task_id"])
+        self.assertEqual(0, payload["data"][0]["status"])
+        self.assertEqual(0, payload["data"][1]["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

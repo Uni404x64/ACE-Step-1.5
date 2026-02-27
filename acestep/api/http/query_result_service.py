@@ -7,23 +7,23 @@ import time
 from typing import Any, Callable, Dict, List
 
 
-def parse_task_id_list(task_id_list_raw: Any) -> List[str]:
-    """Parse a raw ``task_id_list`` field value into task IDs.
+def parse_task_id_list(task_id_list_raw: Any) -> Any:
+    """Parse raw ``task_id_list`` input using legacy permissive semantics.
 
     Args:
-        task_id_list_raw: Either a list of IDs or JSON-encoded list text.
+        task_id_list_raw: Either a list of IDs or JSON-encoded text.
 
     Returns:
-        Parsed task IDs, or an empty list when parsing fails.
+        Raw list value when already a list, parsed JSON value otherwise,
+        or an empty list when JSON parsing fails.
     """
 
     if isinstance(task_id_list_raw, list):
         return task_id_list_raw
     try:
-        parsed = json.loads(task_id_list_raw)
+        return json.loads(task_id_list_raw)
     except Exception:
         return []
-    return parsed if isinstance(parsed, list) else []
 
 
 def _build_running_result_payload(
@@ -31,7 +31,7 @@ def _build_running_result_payload(
     data: str,
     current_time: float,
     task_timeout_seconds: int,
-    log_last_message: str,
+    get_log_last_message: Callable[[], str],
 ) -> Dict[str, Any]:
     """Return one cache-derived response item for the given task."""
 
@@ -51,7 +51,7 @@ def _build_running_result_payload(
         "task_id": task_id,
         "result": data,
         "status": int(status) if status is not None else 1,
-        "progress_text": log_last_message,
+        "progress_text": get_log_last_message(),
     }
 
 
@@ -59,7 +59,7 @@ def _build_store_result_payload(
     task_id: str,
     record: Any,
     map_status: Callable[[str], int],
-    log_last_message: str,
+    get_log_last_message: Callable[[], str],
 ) -> Dict[str, Any]:
     """Return one store-derived response item for the given task."""
 
@@ -122,7 +122,7 @@ def _build_store_result_payload(
             "error": record.error if record.error else None,
         }]
 
-    current_log = log_last_message if status_int == 0 else record.progress_text
+    current_log = get_log_last_message() if status_int == 0 else record.progress_text
     return {
         "task_id": task_id,
         "result": json.dumps(result_data, ensure_ascii=False),
@@ -132,24 +132,24 @@ def _build_store_result_payload(
 
 
 def collect_query_results(
-    task_ids: List[str],
+    task_ids: Any,
     local_cache: Any,
     store: Any,
     map_status: Callable[[str], int],
     result_key_prefix: str,
     task_timeout_seconds: int,
-    log_last_message: str,
+    get_log_last_message: Callable[[], str],
 ) -> List[Dict[str, Any]]:
     """Collect legacy response items for each requested task ID.
 
     Args:
-        task_ids: Task IDs to query.
+        task_ids: Parsed task ID payload to iterate with legacy behavior.
         local_cache: Cache object exposing ``get(key)``.
         store: In-memory store exposing ``get(task_id)``.
         map_status: Mapper from store status text to integer code.
         result_key_prefix: Prefix used for local-cache lookup keys.
         task_timeout_seconds: Timeout threshold for running cached jobs.
-        log_last_message: Current global progress log text.
+        get_log_last_message: Zero-arg callable returning current global log text.
 
     Returns:
         Ordered list of response items matching ``/query_result`` contract.
@@ -168,7 +168,7 @@ def collect_query_results(
                         data=data,
                         current_time=current_time,
                         task_timeout_seconds=task_timeout_seconds,
-                        log_last_message=log_last_message,
+                        get_log_last_message=get_log_last_message,
                     )
                 )
                 continue
@@ -180,7 +180,7 @@ def collect_query_results(
                     task_id=task_id,
                     record=record,
                     map_status=map_status,
-                    log_last_message=log_last_message,
+                    get_log_last_message=get_log_last_message,
                 )
             )
         else:

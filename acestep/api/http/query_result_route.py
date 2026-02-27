@@ -61,6 +61,6 @@ def register_query_result_route(
             map_status=map_status,
             result_key_prefix=result_key_prefix,
             task_timeout_seconds=task_timeout_seconds,
-            log_last_message=log_buffer.last_message,
+            get_log_last_message=lambda: log_buffer.last_message,
         )
         return wrap_response(data_list)
