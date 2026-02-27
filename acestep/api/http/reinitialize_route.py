@@ -26,8 +26,8 @@ def register_reinitialize_route(
     async def reinitialize_service(_: None = Depends(verify_api_key)):
         """Reinitialize components that were unloaded during training/preprocessing."""
 
-        handler = getattr(app.state, "handler", None)
-        llm = getattr(app.state, "llm_handler", None)
+        handler = app.state.handler
+        llm = app.state.llm_handler
 
         # Preserve original api_server contract: missing service state is an HTTP 500.
         if handler is None:
