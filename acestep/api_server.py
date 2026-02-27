@@ -63,6 +63,7 @@ from acestep.api.http.reinitialize_route import register_reinitialize_route
 from acestep.api.http.sample_format_routes import register_sample_format_routes
 from acestep.api.http.audio_route import register_audio_route
 from acestep.api.http.query_result_route import register_query_result_route
+from acestep.api.http.release_task_route import register_release_task_route
 
 from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
@@ -2239,220 +2240,6 @@ def create_app() -> FastAPI:
             avg = float(getattr(app.state, "avg_job_seconds", INITIAL_AVG_JOB_SECONDS))
         return pos * avg
 
-    @app.post("/release_task")
-    async def create_music_generate_job(request: Request, authorization: Optional[str] = Header(None)):
-        content_type = (request.headers.get("content-type") or "").lower()
-        temp_files: list[str] = []
-
-        def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
-            """Build GenerateMusicRequest from parsed parameters."""
-            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
-            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
-            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
-            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
-
-            t_classes = p.get("track_classes")
-            if t_classes is not None and isinstance(t_classes, str):
-                t_classes = [t_classes]
-
-            return GenerateMusicRequest(
-                prompt=p.str("prompt"),
-                lyrics=p.str("lyrics"),
-                thinking=p.bool("thinking"),
-                analysis_only=p.bool("analysis_only"),
-                full_analysis_only=p.bool("full_analysis_only"),
-                sample_mode=p.bool("sample_mode"),
-                sample_query=p.str("sample_query"),
-                use_format=p.bool("use_format"),
-                model=p.str("model") or None,
-                bpm=p.int("bpm"),
-                key_scale=p.str("key_scale"),
-                time_signature=p.str("time_signature"),
-                audio_duration=p.float("audio_duration"),
-                vocal_language=p.str("vocal_language", "en"),
-                inference_steps=p.int("inference_steps", 8),
-                guidance_scale=p.float("guidance_scale", 7.0),
-                use_random_seed=p.bool("use_random_seed", True),
-                seed=p.int("seed", -1),
-                batch_size=p.int("batch_size"),
-                repainting_start=p.float("repainting_start", 0.0),
-                repainting_end=p.float("repainting_end"),
-                instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
-                audio_cover_strength=p.float("audio_cover_strength", 1.0),
-                reference_audio_path=ref_audio,
-                src_audio_path=src_audio,
-                task_type=p.str("task_type", "text2music"),
-                use_adg=p.bool("use_adg"),
-                cfg_interval_start=p.float("cfg_interval_start", 0.0),
-                cfg_interval_end=p.float("cfg_interval_end", 1.0),
-                infer_method=p.str("infer_method", "ode"),
-                shift=p.float("shift", 3.0),
-                audio_format=p.str("audio_format", "mp3"),
-                use_tiled_decode=p.bool("use_tiled_decode", True),
-                lm_model_path=p.str("lm_model_path") or None,
-                lm_backend=p.str("lm_backend", "vllm"),
-                lm_temperature=p.float("lm_temperature", LM_DEFAULT_TEMPERATURE),
-                lm_cfg_scale=p.float("lm_cfg_scale", LM_DEFAULT_CFG_SCALE),
-                lm_top_k=p.int("lm_top_k"),
-                lm_top_p=p.float("lm_top_p", LM_DEFAULT_TOP_P),
-                lm_repetition_penalty=p.float("lm_repetition_penalty", 1.0),
-                lm_negative_prompt=p.str("lm_negative_prompt", "NO USER INPUT"),
-                constrained_decoding=p.bool("constrained_decoding", True),
-                constrained_decoding_debug=p.bool("constrained_decoding_debug"),
-                use_cot_caption=p.bool("use_cot_caption", True),
-                use_cot_language=p.bool("use_cot_language", True),
-                is_format_caption=p.bool("is_format_caption"),
-                allow_lm_batch=p.bool("allow_lm_batch", True),
-                track_name=p.str("track_name"),
-                track_classes=t_classes,
-                **kwargs,
-            )
-
-        if content_type.startswith("application/json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            verify_token_from_request(body, authorization)
-
-            # Explicitly validate manual string paths from JSON input
-            p = RequestParser(body)
-            req = _build_request(
-                p,
-                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-            )
-
-        elif content_type.endswith("+json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            verify_token_from_request(body, authorization)
-
-            p = RequestParser(body)
-            req = _build_request(
-                p,
-                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-            )
-
-        elif content_type.startswith("multipart/form-data"):
-            form = await request.form()
-
-            # Parse form data correctly to support lists ---
-            form_dict = {}
-            for k in form.keys():
-                vals = [v for v in form.getlist(k) if not hasattr(v, 'read')]
-                if len(vals) == 1:
-                    form_dict[k] = vals[0]
-                elif len(vals) > 1:
-                    form_dict[k] = vals
-
-            verify_token_from_request(form_dict, authorization)
-
-            # Support both naming conventions: ref_audio/reference_audio, ctx_audio/src_audio
-            ref_up = form.get("ref_audio") or form.get("reference_audio")
-            ctx_up = form.get("ctx_audio") or form.get("src_audio")
-
-            reference_audio_path = None
-            src_audio_path = None
-
-            if isinstance(ref_up, StarletteUploadFile):
-                reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
-                temp_files.append(reference_audio_path)
-            else:
-                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
-
-            if isinstance(ctx_up, StarletteUploadFile):
-                src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
-                temp_files.append(src_audio_path)
-            else:
-                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
-
-            req = _build_request(
-                RequestParser(dict(form_dict)),
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-            )
-
-        elif content_type.startswith("application/x-www-form-urlencoded"):
-            form = await request.form()
-            form_dict = dict(form)
-            verify_token_from_request(form_dict, authorization)
-            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
-            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
-            req = _build_request(
-                RequestParser(form_dict),
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-            )
-
-        else:
-            raw = await request.body()
-            raw_stripped = raw.lstrip()
-            # Best-effort: accept missing/incorrect Content-Type if payload is valid JSON.
-            if raw_stripped.startswith(b"{") or raw_stripped.startswith(b"["):
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                    if isinstance(body, dict):
-                        verify_token_from_request(body, authorization)
-                        p = RequestParser(body)
-                        req = _build_request(
-                            p,
-                            reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                            src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-                        )
-                    else:
-                        raise HTTPException(status_code=400, detail="JSON payload must be an object")
-                except HTTPException:
-                    raise
-                except Exception:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid JSON body (hint: set 'Content-Type: application/json')",
-                    )
-            # Best-effort: parse key=value bodies even if Content-Type is missing.
-            elif raw_stripped and b"=" in raw:
-                parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-                flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
-                verify_token_from_request(flat, authorization)
-                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
-                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
-                req = _build_request(
-                    RequestParser(flat),
-                    reference_audio_path=reference_audio_path,
-                    src_audio_path=src_audio_path,
-                )
-            else:
-                raise HTTPException(
-                    status_code=415,
-                    detail=(
-                        f"Unsupported Content-Type: {content_type or '(missing)'}; "
-                        "use application/json, application/x-www-form-urlencoded, or multipart/form-data"
-                    ),
-                )
-
-        rec = store.create()
-
-        q: asyncio.Queue = app.state.job_queue
-        if q.full():
-            for p in temp_files:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-            raise HTTPException(status_code=429, detail="Server busy: queue is full")
-
-        if temp_files:
-            async with app.state.job_temp_files_lock:
-                app.state.job_temp_files[rec.job_id] = temp_files
-
-        async with app.state.pending_lock:
-            app.state.pending_ids.append(rec.job_id)
-            position = len(app.state.pending_ids)
-
-        await q.put((rec.job_id, req))
-        return _wrap_response({"task_id": rec.job_id, "status": "queued", "queue_position": position})
-
     register_model_service_routes(
         app=app,
         verify_api_key=verify_api_key,
@@ -2509,6 +2296,22 @@ def create_app() -> FastAPI:
     register_audio_route(
         app=app,
         verify_api_key=verify_api_key,
+    )
+
+    register_release_task_route(
+        app=app,
+        verify_token_from_request=verify_token_from_request,
+        wrap_response=_wrap_response,
+        store=store,
+        request_parser_cls=RequestParser,
+        request_model_cls=GenerateMusicRequest,
+        validate_audio_path=_validate_audio_path,
+        save_upload_to_temp=_save_upload_to_temp,
+        upload_file_type=StarletteUploadFile,
+        default_dit_instruction=DEFAULT_DIT_INSTRUCTION,
+        lm_default_temperature=LM_DEFAULT_TEMPERATURE,
+        lm_default_cfg_scale=LM_DEFAULT_CFG_SCALE,
+        lm_default_top_p=LM_DEFAULT_TOP_P,
     )
 
     register_query_result_route(
