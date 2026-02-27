@@ -83,7 +83,7 @@ uv run python -m unittest discover -s acestep/training -p "*_test.py"
 
 - **Python version**: 3.11-3.12
 - **Indentation**: 4 spaces (no tabs)
-- **Line length**: Implicit, use reasonable line lengths
+- **Line length**: Maximum 100 characters (recommended). See `pyproject.toml` for configured formatter limits. Exceptions allowed for URLs and long strings where wrapping would hurt readability.
 - **Strings**: Double quotes `"` preferred
 - **Imports**: Group by type (stdlib, third-party, local), sort alphabetically within groups
 

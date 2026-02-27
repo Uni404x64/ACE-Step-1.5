@@ -5,11 +5,11 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 
-from acestep.training.lora_utils import (
+from acestep.training.lora_injection import (
     _unwrap_decoder,
-    check_peft_available,
     freeze_non_lora_parameters,
 )
+from acestep.training.lora_utils import check_peft_available
 
 
 class TestUnwrapDecoder(unittest.TestCase):
