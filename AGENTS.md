@@ -49,7 +49,7 @@ uv run python -m unittest discover -s acestep/training -p "*_test.py"
 
 - Prefer single-responsibility modules with clear boundaries.
 - Target module size:
-  - Optimal: `<= 150` LOC @coderabbit: Exceeding this limit is NIGGLE, not hard cap or major issue.
+  - Optimal: `<= 150` LOC
   - Hard cap: `200` LOC
 - Function decomposition rules:
   - Do one thing at a time; if a function description naturally contains "and", split it.
@@ -92,6 +92,7 @@ uv run python -m unittest discover -s acestep/training -p "*_test.py"
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import torch

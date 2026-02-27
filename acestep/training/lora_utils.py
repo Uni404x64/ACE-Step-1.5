@@ -12,7 +12,7 @@ import types
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from acestep.training.path_safety import safe_path
 
@@ -50,16 +50,29 @@ def _unwrap_decoder(module: nn.Module) -> nn.Module:
         The unwrapped base DiT decoder module.
     """
     decoder = module
-    while hasattr(decoder, "_forward_module"):
-        decoder = decoder._forward_module
-    if hasattr(decoder, "base_model"):
-        base_model = decoder.base_model
-        if hasattr(base_model, "model"):
-            decoder = base_model.model
+    seen_ids = {id(decoder)}
+    while True:
+        next_decoder = getattr(decoder, "_forward_module", None)
+        if next_decoder is None:
+            break
+        next_id = id(next_decoder)
+        if next_id in seen_ids:
+            break
+        seen_ids.add(next_id)
+        decoder = next_decoder
+
+    base_model = getattr(decoder, "base_model", None)
+    if base_model is not None:
+        inner_model = getattr(base_model, "model", None)
+        if inner_model is not None and isinstance(inner_model, nn.Module):
+            decoder = inner_model
         else:
             decoder = base_model
-    if hasattr(decoder, "model") and isinstance(decoder.model, nn.Module):
-        decoder = decoder.model
+
+    final_model = getattr(decoder, "model", None)
+    if final_model is not None and isinstance(final_model, nn.Module):
+        decoder = final_model
+
     return decoder
 
 
@@ -92,11 +105,19 @@ def freeze_non_lora_parameters(model, freeze_encoder: bool = True) -> None:
         model: The model to freeze parameters for
         freeze_encoder: Whether to freeze the encoder (condition encoder)
     """
-    # Freeze all parameters first
-    for param in model.parameters():
-        param.requires_grad = False
+    encoder_prefixes = ("encoder", "text_encoder", "vision_encoder", "model.encoder")
 
-    # Count frozen and trainable parameters
+    for name, param in model.named_parameters():
+        is_lora = "lora_" in name
+        is_encoder = name.startswith(encoder_prefixes) or any(
+            name.startswith(f"{prefix}.") for prefix in encoder_prefixes
+        )
+
+        if is_lora:
+            param.requires_grad = True
+        elif freeze_encoder or not is_encoder:
+            param.requires_grad = False
+
     total_params = 0
     trainable_params = 0
 
@@ -207,7 +228,7 @@ def inject_lora_into_dit(
         "target_modules": lora_config.target_modules,
     }
 
-    logger.info(f"LoRA injected into DiT decoder:")
+    logger.info("LoRA injected into DiT decoder:")
     logger.info(f"  Total parameters: {total_params:,}")
     logger.info(
         f"  Trainable parameters: {trainable_params:,} ({info['trainable_ratio']:.2%})"
@@ -341,8 +362,8 @@ def save_training_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
     }
 
-    state_path = os.path.join(output_dir, "training_state.pt")
-    torch.save(training_state, state_path)
+    state_path = os.path.join(output_dir, "training_state.safetensors")
+    save_file(training_state, state_path)
 
     logger.info(
         f"Training checkpoint saved to {output_dir} (epoch {epoch}, step {global_step})"
