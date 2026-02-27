@@ -75,6 +75,12 @@ from acestep.api.runtime_helpers import (
     stop_tensorboard as _runtime_stop_tensorboard,
     temporary_llm_model as _runtime_temporary_llm_model,
 )
+from acestep.api.model_download import (
+    can_access_google as _download_can_access_google,
+    download_from_huggingface as _download_from_hf,
+    download_from_modelscope as _download_from_ms,
+    ensure_model_downloaded as _download_ensure_model_downloaded,
+)
 
 from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
@@ -99,98 +105,19 @@ from acestep.gpu_config import (
 )
 
 
-# =============================================================================
-# Model Auto-Download Support
-# =============================================================================
-
-# Model name to repository mapping
-MODEL_REPO_MAPPING = {
-    # Main unified repository (contains: acestep-v15-turbo, acestep-5Hz-lm-1.7B, Qwen3-Embedding-0.6B, vae)
-    "acestep-v15-turbo": "ACE-Step/Ace-Step1.5",
-    "acestep-5Hz-lm-1.7B": "ACE-Step/Ace-Step1.5",
-    "vae": "ACE-Step/Ace-Step1.5",
-    "Qwen3-Embedding-0.6B": "ACE-Step/Ace-Step1.5",
-    # Separate model repositories
-    "acestep-5Hz-lm-0.6B": "ACE-Step/acestep-5Hz-lm-0.6B",
-    "acestep-5Hz-lm-4B": "ACE-Step/acestep-5Hz-lm-4B",
-    "acestep-v15-base": "ACE-Step/acestep-v15-base",
-    "acestep-v15-sft": "ACE-Step/acestep-v15-sft",
-    "acestep-v15-turbo-shift3": "ACE-Step/acestep-v15-turbo-shift3",
-}
-
-DEFAULT_REPO_ID = "ACE-Step/Ace-Step1.5"
-
-
 def _can_access_google(timeout: float = 3.0) -> bool:
     """Check if Google is accessible (to determine HuggingFace vs ModelScope)."""
-    import socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.settimeout(timeout)
-        sock.connect(("www.google.com", 443))
-        return True
-    except (socket.timeout, socket.error, OSError):
-        return False
-    finally:
-        sock.close()
+    return _download_can_access_google(timeout)
 
 
 def _download_from_huggingface(repo_id: str, local_dir: str, model_name: str) -> str:
     """Download model from HuggingFace Hub."""
-    from huggingface_hub import snapshot_download
-
-    is_unified_repo = repo_id == DEFAULT_REPO_ID or repo_id == "ACE-Step/Ace-Step1.5"
-
-    if is_unified_repo:
-        download_dir = local_dir
-        print(f"[Model Download] Downloading unified repo {repo_id} to {download_dir}...")
-    else:
-        download_dir = os.path.join(local_dir, model_name)
-        os.makedirs(download_dir, exist_ok=True)
-        print(f"[Model Download] Downloading {model_name} from {repo_id} to {download_dir}...")
-
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=download_dir,
-        local_dir_use_symlinks=False,
-    )
-
-    return os.path.join(local_dir, model_name)
+    return _download_from_hf(repo_id, local_dir, model_name)
 
 
 def _download_from_modelscope(repo_id: str, local_dir: str, model_name: str) -> str:
     """Download model from ModelScope."""
-    from modelscope import snapshot_download
-
-    is_unified_repo = repo_id == DEFAULT_REPO_ID or repo_id == "ACE-Step/Ace-Step1.5"
-
-    if is_unified_repo:
-        download_dir = local_dir
-        print(f"[Model Download] Downloading unified repo {repo_id} from ModelScope to {download_dir}...")
-    else:
-        download_dir = os.path.join(local_dir, model_name)
-        os.makedirs(download_dir, exist_ok=True)
-        print(f"[Model Download] Downloading {model_name} from ModelScope {repo_id} to {download_dir}...")
-
-    # ModelScope snapshot_download returns the cache path
-    # Use cache_dir parameter for better compatibility across versions
-    try:
-        # Try with local_dir first (newer versions)
-        result_path = snapshot_download(
-            model_id=repo_id,
-            local_dir=download_dir,
-        )
-        print(f"[Model Download] ModelScope download completed: {result_path}")
-    except TypeError:
-        # Fallback to cache_dir for older versions
-        print("[Model Download] Retrying with cache_dir parameter...")
-        result_path = snapshot_download(
-            model_id=repo_id,
-            cache_dir=download_dir,
-        )
-        print(f"[Model Download] ModelScope download completed: {result_path}")
-
-    return os.path.join(local_dir, model_name)
+    return _download_from_ms(repo_id, local_dir, model_name)
 
 
 def _ensure_model_downloaded(model_name: str, checkpoint_dir: str) -> str:
@@ -204,48 +131,7 @@ def _ensure_model_downloaded(model_name: str, checkpoint_dir: str) -> str:
     Returns:
         Path to the model directory
     """
-    model_path = os.path.join(checkpoint_dir, model_name)
-
-    # Check if model already exists
-    if os.path.exists(model_path) and os.listdir(model_path):
-        print(f"[Model Download] Model {model_name} already exists at {model_path}")
-        return model_path
-
-    # Get repository ID
-    repo_id = MODEL_REPO_MAPPING.get(model_name, DEFAULT_REPO_ID)
-
-    print(f"[Model Download] Model {model_name} not found, checking network...")
-
-    # Check for user preference
-    prefer_source = os.environ.get("ACESTEP_DOWNLOAD_SOURCE", "").lower()
-
-    # Determine download source
-    if prefer_source == "huggingface":
-        use_huggingface = True
-        print("[Model Download] User preference: HuggingFace Hub")
-    elif prefer_source == "modelscope":
-        use_huggingface = False
-        print("[Model Download] User preference: ModelScope")
-    else:
-        use_huggingface = _can_access_google()
-        print(f"[Model Download] Auto-detected: {'HuggingFace Hub' if use_huggingface else 'ModelScope'}")
-
-    if use_huggingface:
-        print("[Model Download] Using HuggingFace Hub...")
-        try:
-            return _download_from_huggingface(repo_id, checkpoint_dir, model_name)
-        except Exception as e:
-            print(f"[Model Download] HuggingFace download failed: {e}")
-            print("[Model Download] Falling back to ModelScope...")
-            return _download_from_modelscope(repo_id, checkpoint_dir, model_name)
-    else:
-        print("[Model Download] Using ModelScope...")
-        try:
-            return _download_from_modelscope(repo_id, checkpoint_dir, model_name)
-        except Exception as e:
-            print(f"[Model Download] ModelScope download failed: {e}")
-            print("[Model Download] Trying HuggingFace as fallback...")
-            return _download_from_huggingface(repo_id, checkpoint_dir, model_name)
+    return _download_ensure_model_downloaded(model_name, checkpoint_dir)
 
 
 def _get_project_root() -> str:
