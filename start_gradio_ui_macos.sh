@@ -204,7 +204,7 @@ _startup_update_check() {
     echo
 
     read -rp "Update now before starting? (Y/N): " update_choice
-    if [[ "${update_choice^^}" == "Y" ]]; then
+    if [[ "$(echo "$update_choice" | tr '[:lower:]' '[:upper:]')" == "Y" ]]; then
         if [[ -f "$SCRIPT_DIR/check_update.sh" ]]; then
             bash "$SCRIPT_DIR/check_update.sh"
         else
@@ -316,7 +316,7 @@ if ! command -v uv &>/dev/null; then
     echo
     read -rp "Install uv now? (Y/N): " INSTALL_UV
 
-    if [[ "${INSTALL_UV^^}" == "Y" ]]; then
+    if [[ "$(echo "$INSTALL_UV" | tr '[:lower:]' '[:upper:]')" == "Y" ]]; then
         echo
         bash "$SCRIPT_DIR/install_uv.sh" --silent
         INSTALL_RESULT=$?
