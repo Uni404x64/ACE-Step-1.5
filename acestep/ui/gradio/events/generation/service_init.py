@@ -14,7 +14,7 @@ from acestep.gpu_config import (
     get_global_gpu_config, is_lm_model_size_allowed, find_best_lm_model_on_disk,
     get_gpu_config_for_tier, set_global_gpu_config, GPU_TIER_LABELS, GPU_TIER_CONFIGS,
 )
-from .model_config import _is_pure_base_model, get_model_type_ui_settings
+from .model_config import is_pure_base_model, get_model_type_ui_settings
 
 
 def refresh_checkpoints(dit_handler):
@@ -53,14 +53,18 @@ def init_service_wrapper(
             quantization = False
             quant_value = None
 
-    if init_llm and not gpu_config.available_lm_models:
-        logger.warning(
-            f"⚠️ GPU tier {gpu_config.tier} ({gpu_config.gpu_memory_gb:.1f}GB) does not support LM on GPU. "
-            "Falling back to CPU for LM initialization."
-        )
-        llm_handler.device = "cpu"
-    else:
-        llm_handler.device = device
+    # Compute lm_device only when initializing the LLM to avoid overwriting a
+    # previously-resolved device (e.g. "cuda") with the raw UI value ("auto").
+    # "auto" is resolved to the concrete device inside llm_handler.initialize().
+    if init_llm:
+        if not gpu_config.available_lm_models:
+            logger.warning(
+                f"⚠️ GPU tier {gpu_config.tier} ({gpu_config.gpu_memory_gb:.1f}GB) does not support LM on GPU. "
+                "Falling back to CPU for LM initialization."
+            )
+            lm_device = "cpu"
+        else:
+            lm_device = device
 
     if init_llm and lm_model_path and gpu_config.available_lm_models:
         if not is_lm_model_size_allowed(lm_model_path, gpu_config.available_lm_models):
@@ -100,7 +104,7 @@ def init_service_wrapper(
             checkpoint_dir=checkpoint_dir,
             lm_model_path=lm_model_path,
             backend=backend,
-            device=llm_handler.device,
+            device=lm_device,
             offload_to_cpu=offload_to_cpu,
             dtype=None,
         )
@@ -114,7 +118,7 @@ def init_service_wrapper(
     accordion_state = gr.Accordion(open=not is_model_initialized)
 
     is_turbo = dit_handler.is_turbo_model()
-    is_pure_base = _is_pure_base_model((config_path or "").lower())
+    is_pure_base = is_pure_base_model((config_path or "").lower())
     model_type_settings = get_model_type_ui_settings(
         is_turbo, current_mode=current_mode, is_pure_base=is_pure_base,
     )

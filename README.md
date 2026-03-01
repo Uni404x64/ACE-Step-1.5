@@ -6,7 +6,8 @@
     <a href="https://modelscope.cn/models/ACE-Step/Ace-Step1.5">ModelScope</a> |
     <a href="https://huggingface.co/spaces/ACE-Step/Ace-Step-v1.5">Space Demo</a> |
     <a href="https://discord.gg/PeWDxrkdj7">Discord</a> |
-    <a href="https://arxiv.org/abs/2602.00744">Technical Report</a>
+    <a href="https://arxiv.org/abs/2602.00744">Technical Report</a> |
+    <a href="https://github.com/ace-step/awesome-ace-step">Awesome ACE-Step</a>
 </p>
 
 <p align="center">
@@ -263,6 +264,10 @@ The only official website for the ACE-Step project is our GitHub Pages site.
 🚫 Fake domains include but are not limited to:
 ac\*\*p.com, a\*\*p.org, a\*\*\*c.org  
 ⚠️ Please be cautious. Do not visit, trust, or make payments on any of those sites.
+
+## 🌐 Community & Ecosystem
+
+Check out **[Awesome ACE-Step](https://github.com/ace-step/awesome-ace-step)** — a curated list of community projects, alternative UIs, ComfyUI nodes, cloud deployments, training tools, and more built around ACE-Step.
 
 ## 🙏 Acknowledgements
 

@@ -19,7 +19,6 @@ import asyncio
 import glob
 import json
 import os
-import random
 import sys
 import time
 import traceback
@@ -28,11 +27,9 @@ import urllib.parse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Literal, Optional, Union
-from uuid import uuid4
 from loguru import logger
 import torch
 
@@ -48,6 +45,41 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from acestep.api.train_api_service import (
     initialize_training_state,
     register_training_api_routes,
+)
+from acestep.api.jobs.models import (
+    CreateJobResponse,
+    JobResponse,
+    JobResult,
+    JobStatus,
+)
+from acestep.api.jobs.store import _JobStore
+from acestep.api.http.lora_routes import register_lora_routes
+from acestep.api.http.model_service_routes import register_model_service_routes
+from acestep.api.http.reinitialize_route import register_reinitialize_route
+from acestep.api.http.sample_format_routes import register_sample_format_routes
+from acestep.api.http.audio_route import register_audio_route
+from acestep.api.http.query_result_route import register_query_result_route
+from acestep.api.http.release_task_route import register_release_task_route
+from acestep.api.jobs.local_cache_updates import (
+    update_local_cache,
+    update_local_cache_progress,
+)
+from acestep.api.jobs.worker_loops import (
+    process_queue_item,
+    run_job_store_cleanup_loop,
+)
+from acestep.api.runtime_helpers import (
+    append_jsonl as _runtime_append_jsonl,
+    atomic_write_json as _runtime_atomic_write_json,
+    start_tensorboard as _runtime_start_tensorboard,
+    stop_tensorboard as _runtime_stop_tensorboard,
+    temporary_llm_model as _runtime_temporary_llm_model,
+)
+from acestep.api.model_download import (
+    can_access_google as _download_can_access_google,
+    download_from_huggingface as _download_from_hf,
+    download_from_modelscope as _download_from_ms,
+    ensure_model_downloaded as _download_ensure_model_downloaded,
 )
 
 from acestep.handler import AceStepHandler
@@ -73,98 +105,19 @@ from acestep.gpu_config import (
 )
 
 
-# =============================================================================
-# Model Auto-Download Support
-# =============================================================================
-
-# Model name to repository mapping
-MODEL_REPO_MAPPING = {
-    # Main unified repository (contains: acestep-v15-turbo, acestep-5Hz-lm-1.7B, Qwen3-Embedding-0.6B, vae)
-    "acestep-v15-turbo": "ACE-Step/Ace-Step1.5",
-    "acestep-5Hz-lm-1.7B": "ACE-Step/Ace-Step1.5",
-    "vae": "ACE-Step/Ace-Step1.5",
-    "Qwen3-Embedding-0.6B": "ACE-Step/Ace-Step1.5",
-    # Separate model repositories
-    "acestep-5Hz-lm-0.6B": "ACE-Step/acestep-5Hz-lm-0.6B",
-    "acestep-5Hz-lm-4B": "ACE-Step/acestep-5Hz-lm-4B",
-    "acestep-v15-base": "ACE-Step/acestep-v15-base",
-    "acestep-v15-sft": "ACE-Step/acestep-v15-sft",
-    "acestep-v15-turbo-shift3": "ACE-Step/acestep-v15-turbo-shift3",
-}
-
-DEFAULT_REPO_ID = "ACE-Step/Ace-Step1.5"
-
-
 def _can_access_google(timeout: float = 3.0) -> bool:
     """Check if Google is accessible (to determine HuggingFace vs ModelScope)."""
-    import socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.settimeout(timeout)
-        sock.connect(("www.google.com", 443))
-        return True
-    except (socket.timeout, socket.error, OSError):
-        return False
-    finally:
-        sock.close()
+    return _download_can_access_google(timeout)
 
 
 def _download_from_huggingface(repo_id: str, local_dir: str, model_name: str) -> str:
     """Download model from HuggingFace Hub."""
-    from huggingface_hub import snapshot_download
-
-    is_unified_repo = repo_id == DEFAULT_REPO_ID or repo_id == "ACE-Step/Ace-Step1.5"
-
-    if is_unified_repo:
-        download_dir = local_dir
-        print(f"[Model Download] Downloading unified repo {repo_id} to {download_dir}...")
-    else:
-        download_dir = os.path.join(local_dir, model_name)
-        os.makedirs(download_dir, exist_ok=True)
-        print(f"[Model Download] Downloading {model_name} from {repo_id} to {download_dir}...")
-
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=download_dir,
-        local_dir_use_symlinks=False,
-    )
-
-    return os.path.join(local_dir, model_name)
+    return _download_from_hf(repo_id, local_dir, model_name)
 
 
 def _download_from_modelscope(repo_id: str, local_dir: str, model_name: str) -> str:
     """Download model from ModelScope."""
-    from modelscope import snapshot_download
-
-    is_unified_repo = repo_id == DEFAULT_REPO_ID or repo_id == "ACE-Step/Ace-Step1.5"
-
-    if is_unified_repo:
-        download_dir = local_dir
-        print(f"[Model Download] Downloading unified repo {repo_id} from ModelScope to {download_dir}...")
-    else:
-        download_dir = os.path.join(local_dir, model_name)
-        os.makedirs(download_dir, exist_ok=True)
-        print(f"[Model Download] Downloading {model_name} from ModelScope {repo_id} to {download_dir}...")
-
-    # ModelScope snapshot_download returns the cache path
-    # Use cache_dir parameter for better compatibility across versions
-    try:
-        # Try with local_dir first (newer versions)
-        result_path = snapshot_download(
-            model_id=repo_id,
-            local_dir=download_dir,
-        )
-        print(f"[Model Download] ModelScope download completed: {result_path}")
-    except TypeError:
-        # Fallback to cache_dir for older versions
-        print("[Model Download] Retrying with cache_dir parameter...")
-        result_path = snapshot_download(
-            model_id=repo_id,
-            cache_dir=download_dir,
-        )
-        print(f"[Model Download] ModelScope download completed: {result_path}")
-
-    return os.path.join(local_dir, model_name)
+    return _download_from_ms(repo_id, local_dir, model_name)
 
 
 def _ensure_model_downloaded(model_name: str, checkpoint_dir: str) -> str:
@@ -178,48 +131,7 @@ def _ensure_model_downloaded(model_name: str, checkpoint_dir: str) -> str:
     Returns:
         Path to the model directory
     """
-    model_path = os.path.join(checkpoint_dir, model_name)
-
-    # Check if model already exists
-    if os.path.exists(model_path) and os.listdir(model_path):
-        print(f"[Model Download] Model {model_name} already exists at {model_path}")
-        return model_path
-
-    # Get repository ID
-    repo_id = MODEL_REPO_MAPPING.get(model_name, DEFAULT_REPO_ID)
-
-    print(f"[Model Download] Model {model_name} not found, checking network...")
-
-    # Check for user preference
-    prefer_source = os.environ.get("ACESTEP_DOWNLOAD_SOURCE", "").lower()
-
-    # Determine download source
-    if prefer_source == "huggingface":
-        use_huggingface = True
-        print("[Model Download] User preference: HuggingFace Hub")
-    elif prefer_source == "modelscope":
-        use_huggingface = False
-        print("[Model Download] User preference: ModelScope")
-    else:
-        use_huggingface = _can_access_google()
-        print(f"[Model Download] Auto-detected: {'HuggingFace Hub' if use_huggingface else 'ModelScope'}")
-
-    if use_huggingface:
-        print("[Model Download] Using HuggingFace Hub...")
-        try:
-            return _download_from_huggingface(repo_id, checkpoint_dir, model_name)
-        except Exception as e:
-            print(f"[Model Download] HuggingFace download failed: {e}")
-            print("[Model Download] Falling back to ModelScope...")
-            return _download_from_modelscope(repo_id, checkpoint_dir, model_name)
-    else:
-        print("[Model Download] Using ModelScope...")
-        try:
-            return _download_from_modelscope(repo_id, checkpoint_dir, model_name)
-        except Exception as e:
-            print(f"[Model Download] ModelScope download failed: {e}")
-            print("[Model Download] Trying HuggingFace as fallback...")
-            return _download_from_huggingface(repo_id, checkpoint_dir, model_name)
+    return _download_ensure_model_downloaded(model_name, checkpoint_dir)
 
 
 def _get_project_root() -> str:
@@ -451,9 +363,6 @@ def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
     return detected_language, is_instrumental
 
 
-JobStatus = Literal["queued", "running", "succeeded", "failed"]
-
-
 class GenerateMusicRequest(BaseModel):
     prompt: str = Field(default="", description="Text prompt describing the music")
     lyrics: str = Field(default="", description="Lyric text")
@@ -540,407 +449,44 @@ class GenerateMusicRequest(BaseModel):
         allow_population_by_alias = True
 
 
-class LoadLoRARequest(BaseModel):
-    lora_path: str = Field(..., description="Path to LoRA adapter directory or LoKr/LyCORIS safetensors file")
-    adapter_name: Optional[str] = Field(default=None, description="Optional adapter name (uses path-derived name if omitted)")
-
-
-class SetLoRAScaleRequest(BaseModel):
-    adapter_name: Optional[str] = Field(default=None, description="Optional adapter name; defaults to active adapter")
-    scale: float = Field(..., ge=0.0, le=1.0, description="LoRA scale (0.0-1.0)")
-
-
-class ToggleLoRARequest(BaseModel):
-    use_lora: bool = Field(..., description="Enable or disable LoRA")
-
-
 def _stop_tensorboard(app: FastAPI) -> None:
     """Stop TensorBoard process if running."""
-    try:
-        proc = getattr(app.state, "tensorboard_process", None)
-    except Exception:
-        proc = None
 
-    if proc is None:
-        return
-
-    try:
-        proc.terminate()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=3)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    try:
-        app.state.tensorboard_process = None
-    except Exception:
-        pass
+    _runtime_stop_tensorboard(app)
 
 
 def _start_tensorboard(app: FastAPI, logdir: str) -> Optional[str]:
     """(Re)start TensorBoard with the given logdir and return URL if successful."""
-    try:
-        import subprocess
-        import sys
-        import os
 
-        tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
-        _stop_tensorboard(app)
-
-        # Use virtual environment's tensorboard if available
-        if sys.prefix != sys.base_prefix:  # Running in virtual environment
-            tensorboard_cmd = os.path.join(sys.prefix, "Scripts", "tensorboard.exe")
-            if not os.path.exists(tensorboard_cmd):
-                tensorboard_cmd = os.path.join(sys.prefix, "bin", "tensorboard")
-            if not os.path.exists(tensorboard_cmd):
-                # Fallback to system tensorboard if venv version not found
-                tensorboard_cmd = "tensorboard"
-        else:
-            tensorboard_cmd = "tensorboard"
-
-        app.state.tensorboard_process = subprocess.Popen(
-            [
-                tensorboard_cmd,
-                "--logdir",
-                logdir,
-                "--port",
-                str(tensorboard_port),
-                "--bind_all",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return f"http://localhost:{tensorboard_port}"
-    except Exception:
-        return None
+    return _runtime_start_tensorboard(app, logdir, stop_tensorboard_fn=_runtime_stop_tensorboard)
 
 
 @contextmanager
 def _temporary_llm_model(app: FastAPI, llm: "LLMHandler", lm_model_path: Optional[str]):
-    """Temporarily switch LLM model for a critical section and restore afterward.
+    """Temporarily switch LLM model for a critical section and restore afterward."""
 
-    This is intentionally best-effort and conservative:
-    - If lm_model_path is empty/None -> no-op
-    - If LLM isn't initialized -> no-op (handlers already validate this)
-    - Uses app.state._llm_init_lock to serialize LLM re-inits
-    """
-    desired = (lm_model_path or "").strip()
-    if not desired:
+    with _runtime_temporary_llm_model(
+        app=app,
+        llm=llm,
+        lm_model_path=lm_model_path,
+        get_project_root=_get_project_root,
+        get_model_name=_get_model_name,
+        ensure_model_downloaded=_ensure_model_downloaded,
+        env_bool=_env_bool,
+    ):
         yield
-        return
-
-    if llm is None or not getattr(llm, "llm_initialized", False):
-        yield
-        return
-
-    lock = getattr(app.state, "_llm_init_lock", None)
-    if lock is None:
-        yield
-        return
-
-    with lock:
-        prev_params = getattr(llm, "last_init_params", None)
-        prev_model = (prev_params or {}).get("lm_model_path") if isinstance(prev_params, dict) else None
-        if prev_model and prev_model.strip() == desired:
-            yield
-            return
-
-        project_root = _get_project_root()
-        checkpoint_dir = os.path.join(project_root, "checkpoints")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        lm_model_name = _get_model_name(desired)
-        if lm_model_name:
-            try:
-                _ensure_model_downloaded(lm_model_name, checkpoint_dir)
-            except Exception:
-                pass
-
-        restore_params = prev_params if isinstance(prev_params, dict) else None
-
-        ok_switched = False
-        try:
-            new_params = dict(restore_params) if restore_params else {
-                "checkpoint_dir": checkpoint_dir,
-                "backend": os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower() or "vllm",
-                "device": os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto")),
-                "offload_to_cpu": _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False),
-                "dtype": None,
-            }
-            new_params["checkpoint_dir"] = checkpoint_dir
-            new_params["lm_model_path"] = desired
-
-            status, ok = llm.initialize(**new_params)
-            if ok:
-                ok_switched = True
-                try:
-                    app.state._llm_initialized = True
-                    app.state._llm_init_error = None
-                except Exception:
-                    pass
-            else:
-                try:
-                    app.state._llm_initialized = False
-                    app.state._llm_init_error = status
-                except Exception:
-                    pass
-        except Exception as e:
-            try:
-                app.state._llm_initialized = False
-                app.state._llm_init_error = str(e)
-            except Exception:
-                pass
-
-        try:
-            yield
-        finally:
-            if not ok_switched:
-                return
-            if not restore_params:
-                return
-            try:
-                llm.initialize(**restore_params)
-                try:
-                    app.state._llm_initialized = True
-                    app.state._llm_init_error = None
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    app.state._llm_initialized = False
-                    app.state._llm_init_error = str(e)
-                except Exception:
-                    pass
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     """Write JSON atomically to reduce corruption risk during incremental saves."""
 
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory or None)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        raise
+    _runtime_atomic_write_json(path, payload)
 
 
 def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
     """Append a single JSONL record for audit/progress tracing."""
 
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-class CreateJobResponse(BaseModel):
-    task_id: str
-    status: JobStatus
-    queue_position: int = 0  # 1-based best-effort position when queued
-    progress_text: Optional[str] = ""
-
-
-class JobResult(BaseModel):
-    first_audio_path: Optional[str] = None
-    second_audio_path: Optional[str] = None
-    audio_paths: list[str] = Field(default_factory=list)
-
-    generation_info: str = ""
-    status_message: str = ""
-    seed_value: str = ""
-
-    metas: Dict[str, Any] = Field(default_factory=dict)
-    bpm: Optional[int] = None
-    duration: Optional[float] = None
-    genres: Optional[str] = None
-    keyscale: Optional[str] = None
-    timesignature: Optional[str] = None
-
-    # Model information
-    lm_model: Optional[str] = None
-    dit_model: Optional[str] = None
-
-
-class JobResponse(BaseModel):
-    job_id: str
-    status: JobStatus
-    created_at: float
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-
-    # queue observability
-    queue_position: int = 0
-    eta_seconds: Optional[float] = None
-    avg_job_seconds: Optional[float] = None
-
-    result: Optional[JobResult] = None
-    error: Optional[str] = None
-
-
-@dataclass
-class _JobRecord:
-    job_id: str
-    status: JobStatus
-    created_at: float
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    progress_text: str = ""
-    status_text: str = ""
-    env: str = "development"
-    progress: float = 0.0  # 0.0 - 1.0
-    stage: str = "queued"
-    updated_at: Optional[float] = None
-    # OpenRouter integration: synchronous wait / streaming support
-    done_event: Optional[asyncio.Event] = None
-    progress_queue: Optional[asyncio.Queue] = None
-
-
-class _JobStore:
-    def __init__(self, max_age_seconds: int = JOB_STORE_MAX_AGE_SECONDS) -> None:
-        self._lock = Lock()
-        self._jobs: Dict[str, _JobRecord] = {}
-        self._max_age = max_age_seconds
-
-    def create(self) -> _JobRecord:
-        job_id = str(uuid4())
-        now = time.time()
-        rec = _JobRecord(job_id=job_id, status="queued", created_at=now, progress=0.0, stage="queued", updated_at=now)
-        with self._lock:
-            self._jobs[job_id] = rec
-        return rec
-
-    def create_with_id(self, job_id: str, env: str = "development") -> _JobRecord:
-        """Create job record with specified ID"""
-        now = time.time()
-        rec = _JobRecord(
-            job_id=job_id,
-            status="queued",
-            created_at=now,
-            env=env,
-            progress=0.0,
-            stage="queued",
-            updated_at=now,
-        )
-        with self._lock:
-            self._jobs[job_id] = rec
-        return rec
-
-    def get(self, job_id: str) -> Optional[_JobRecord]:
-        with self._lock:
-            return self._jobs.get(job_id)
-
-    def mark_running(self, job_id: str) -> None:
-        with self._lock:
-            rec = self._jobs[job_id]
-            rec.status = "running"
-            rec.started_at = time.time()
-            rec.progress = max(rec.progress, 0.01)
-            rec.stage = "running"
-            rec.updated_at = time.time()
-
-    def mark_succeeded(self, job_id: str, result: Dict[str, Any]) -> None:
-        with self._lock:
-            rec = self._jobs[job_id]
-            rec.status = "succeeded"
-            rec.finished_at = time.time()
-            rec.result = result
-            rec.error = None
-            rec.progress = 1.0
-            rec.stage = "succeeded"
-            rec.updated_at = time.time()
-
-    def mark_failed(self, job_id: str, error: str) -> None:
-        with self._lock:
-            rec = self._jobs[job_id]
-            rec.status = "failed"
-            rec.finished_at = time.time()
-            rec.result = None
-            rec.error = error
-            rec.progress = rec.progress if rec.progress > 0 else 0.0
-            rec.stage = "failed"
-            rec.updated_at = time.time()
-
-    def update_progress(self, job_id: str, progress: float, stage: Optional[str] = None) -> None:
-        with self._lock:
-            rec = self._jobs.get(job_id)
-            if not rec:
-                return
-            rec.progress = max(0.0, min(1.0, float(progress)))
-            if stage:
-                rec.stage = stage
-            rec.updated_at = time.time()
-
-    def cleanup_old_jobs(self, max_age_seconds: Optional[int] = None) -> int:
-        """
-        Clean up completed jobs older than max_age_seconds.
-
-        Only removes jobs with status 'succeeded' or 'failed'.
-        Jobs that are 'queued' or 'running' are never removed.
-
-        Returns the number of jobs removed.
-        """
-        max_age = max_age_seconds if max_age_seconds is not None else self._max_age
-        now = time.time()
-        removed = 0
-
-        with self._lock:
-            to_remove = []
-            for job_id, rec in self._jobs.items():
-                if rec.status in ("succeeded", "failed"):
-                    finish_time = rec.finished_at or rec.created_at
-                    age = now - finish_time
-                    if age > max_age:
-                        to_remove.append(job_id)
-
-            for job_id in to_remove:
-                del self._jobs[job_id]
-                removed += 1
-
-        return removed
-
-    def get_stats(self) -> Dict[str, int]:
-        """Get statistics about jobs in the store."""
-        with self._lock:
-            stats = {
-                "total": len(self._jobs),
-                "queued": 0,
-                "running": 0,
-                "succeeded": 0,
-                "failed": 0,
-            }
-            for rec in self._jobs.values():
-                if rec.status in stats:
-                    stats[rec.status] += 1
-            return stats
-
-    def update_status_text(self, job_id: str, text: str) -> None:
-        with self._lock:
-            if job_id in self._jobs:
-                self._jobs[job_id].status_text = text
-
-    def update_progress_text(self, job_id: str, text: str) -> None:
-        with self._lock:
-            if job_id in self._jobs:
-                self._jobs[job_id].progress_text = text
-
+    _runtime_append_jsonl(path, record)
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -1340,120 +886,32 @@ def create_app() -> FastAPI:
                     pass
 
         def _update_local_cache(job_id: str, result: Optional[Dict], status: str) -> None:
-            """Update local cache with job result"""
-            local_cache = getattr(app.state, 'local_cache', None)
-            if not local_cache:
-                return
+            """Update local cache with terminal job state payload."""
 
-            rec = store.get(job_id)
-            env = getattr(rec, 'env', 'development') if rec else 'development'
-            create_time = rec.created_at if rec else time.time()
-
-            status_int = _map_status(status)
-
-            if status == "succeeded" and result:
-                # Check if it's a "Full Analysis" result
-                if result.get("status_message") == "Full Hardware Analysis Success":
-                    result_data = [result]
-                else:
-                    audio_paths = result.get("audio_paths", [])
-                    # Final prompt/lyrics (may be modified by thinking/format)
-                    final_prompt = result.get("prompt", "")
-                    final_lyrics = result.get("lyrics", "")
-                    # Original user input from metas
-                    metas_raw = result.get("metas", {}) or {}
-                    original_prompt = metas_raw.get("prompt", "")
-                    original_lyrics = metas_raw.get("lyrics", "")
-                    # metas contains original input + other metadata
-                    metas = {
-                        "bpm": metas_raw.get("bpm"),
-                        "duration": metas_raw.get("duration"),
-                        "genres": metas_raw.get("genres", ""),
-                        "keyscale": metas_raw.get("keyscale", ""),
-                        "timesignature": metas_raw.get("timesignature", ""),
-                        "prompt": original_prompt,
-                        "lyrics": original_lyrics,
-                    }
-                    # Extra fields for Discord bot
-                    generation_info = result.get("generation_info", "")
-                    seed_value = result.get("seed_value", "")
-                    lm_model = result.get("lm_model", "")
-                    dit_model = result.get("dit_model", "")
-
-                    if audio_paths:
-                        result_data = [
-                            {
-                                "file": p,
-                                "wave": "",
-                                "status": status_int,
-                                "create_time": int(create_time),
-                                "env": env,
-                                "prompt": final_prompt,
-                                "lyrics": final_lyrics,
-                                "metas": metas,
-                                "generation_info": generation_info,
-                                "seed_value": seed_value,
-                                "lm_model": lm_model,
-                                "dit_model": dit_model,
-                                "progress": 1.0,
-                                "stage": "succeeded",
-                            }
-                            for p in audio_paths
-                        ]
-                    else:
-                        result_data = [{
-                            "file": "",
-                            "wave": "",
-                            "status": status_int,
-                            "create_time": int(create_time),
-                            "env": env,
-                            "prompt": final_prompt,
-                            "lyrics": final_lyrics,
-                            "metas": metas,
-                            "generation_info": generation_info,
-                            "seed_value": seed_value,
-                            "lm_model": lm_model,
-                            "dit_model": dit_model,
-                            "progress": 1.0,
-                            "stage": "succeeded",
-                        }]
-            else:
-                result_data = [{
-                    "file": "",
-                    "wave": "",
-                    "status": status_int,
-                    "create_time": int(create_time),
-                    "env": env,
-                    "progress": 0.0,
-                    "stage": "failed" if status == "failed" else status,
-                }]
-
-            result_key = f"{RESULT_KEY_PREFIX}{job_id}"
-            local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
+            update_local_cache(
+                local_cache=getattr(app.state, "local_cache", None),
+                store=store,
+                job_id=job_id,
+                result=result,
+                status=status,
+                map_status=_map_status,
+                result_key_prefix=RESULT_KEY_PREFIX,
+                result_expire_seconds=RESULT_EXPIRE_SECONDS,
+            )
 
         def _update_local_cache_progress(job_id: str, progress: float, stage: str) -> None:
-            """Update local cache with job progress for queued/running states."""
-            local_cache = getattr(app.state, 'local_cache', None)
-            if not local_cache:
-                return
+            """Update local cache with queued/running progress payload."""
 
-            rec = store.get(job_id)
-            env = getattr(rec, 'env', 'development') if rec else 'development'
-            create_time = rec.created_at if rec else time.time()
-            status_int = _map_status("running")
-
-            result_data = [{
-                "file": "",
-                "wave": "",
-                "status": status_int,
-                "create_time": int(create_time),
-                "env": env,
-                "progress": float(progress),
-                "stage": stage,
-            }]
-
-            result_key = f"{RESULT_KEY_PREFIX}{job_id}"
-            local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
+            update_local_cache_progress(
+                local_cache=getattr(app.state, "local_cache", None),
+                store=store,
+                job_id=job_id,
+                progress=progress,
+                stage=stage,
+                map_status=_map_status,
+                result_key_prefix=RESULT_KEY_PREFIX,
+                result_expire_seconds=RESULT_EXPIRE_SECONDS,
+            )
 
         async def _run_one_job(job_id: str, req: GenerateMusicRequest) -> None:
             job_store: _JobStore = app.state.job_store
@@ -1521,6 +979,17 @@ def create_app() -> FastAPI:
                                 "(use_cot_caption, use_cot_language) will be auto-disabled."
                             )
                             print("[API Server] LLM lazy load blocked: LLM was not initialized at startup")
+                            return
+
+                        # Respect ACESTEP_INIT_LLM=false even in lazy-load / --no-init mode
+                        init_llm_env = os.getenv("ACESTEP_INIT_LLM", "").strip().lower()
+                        if init_llm_env in {"0", "false", "no", "n", "off"}:
+                            app.state._llm_lazy_load_disabled = True
+                            app.state._llm_init_error = (
+                                "LLM disabled via ACESTEP_INIT_LLM=false. "
+                                "Optional LLM features (use_cot_caption, use_cot_language) will be auto-disabled."
+                            )
+                            print("[API Server] LLM lazy load blocked: ACESTEP_INIT_LLM=false")
                             return
 
                         project_root = _get_project_root()
@@ -2106,52 +1575,21 @@ def create_app() -> FastAPI:
         async def _queue_worker(worker_idx: int) -> None:
             while True:
                 job_id, req = await app.state.job_queue.get()
-                rec = store.get(job_id)
-                try:
-                    async with app.state.pending_lock:
-                        try:
-                            app.state.pending_ids.remove(job_id)
-                        except ValueError:
-                            pass
-
-                    await _run_one_job(job_id, req)
-
-                    # Notify OpenRouter waiters after job completion
-                    if rec and rec.progress_queue:
-                        if rec.status == "succeeded" and rec.result:
-                            await rec.progress_queue.put({"type": "result", "result": rec.result})
-                        elif rec.status == "failed":
-                            await rec.progress_queue.put({"type": "error", "content": rec.error or "Generation failed"})
-                        await rec.progress_queue.put({"type": "done"})
-                    if rec and rec.done_event:
-                        rec.done_event.set()
-
-                except Exception as exc:
-                    # _run_one_job raised (e.g. _ensure_initialized failed)
-                    if rec and rec.status not in ("succeeded", "failed"):
-                        store.mark_failed(job_id, str(exc))
-                    if rec and rec.progress_queue:
-                        await rec.progress_queue.put({"type": "error", "content": str(exc)})
-                        await rec.progress_queue.put({"type": "done"})
-                    if rec and rec.done_event:
-                        rec.done_event.set()
-                finally:
-                    await _cleanup_job_temp_files(job_id)
-                    app.state.job_queue.task_done()
+                await process_queue_item(
+                    job_id=job_id,
+                    req=req,
+                    app_state=app.state,
+                    store=store,
+                    run_one_job=_run_one_job,
+                    cleanup_job_temp_files=_cleanup_job_temp_files,
+                )
 
         async def _job_store_cleanup_worker() -> None:
             """Background task to periodically clean up old completed jobs."""
-            while True:
-                try:
-                    await asyncio.sleep(JOB_STORE_CLEANUP_INTERVAL)
-                    removed = store.cleanup_old_jobs()
-                    if removed > 0:
-                        stats = store.get_stats()
-                        print(f"[API Server] Cleaned up {removed} old jobs. Current stats: {stats}")
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    print(f"[API Server] Job cleanup error: {e}")
+            await run_job_store_cleanup_loop(
+                store=store,
+                cleanup_interval_seconds=JOB_STORE_CLEANUP_INTERVAL,
+            )
 
         worker_count = max(1, WORKER_COUNT)
         workers = [asyncio.create_task(_queue_worker(i)) for i in range(worker_count)]
@@ -2457,760 +1895,47 @@ def create_app() -> FastAPI:
             avg = float(getattr(app.state, "avg_job_seconds", INITIAL_AVG_JOB_SECONDS))
         return pos * avg
 
-    @app.post("/release_task")
-    async def create_music_generate_job(request: Request, authorization: Optional[str] = Header(None)):
-        content_type = (request.headers.get("content-type") or "").lower()
-        temp_files: list[str] = []
-
-        def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
-            """Build GenerateMusicRequest from parsed parameters."""
-            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
-            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
-            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
-            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
-
-            t_classes = p.get("track_classes")
-            if t_classes is not None and isinstance(t_classes, str):
-                t_classes = [t_classes]
-
-            return GenerateMusicRequest(
-                prompt=p.str("prompt"),
-                lyrics=p.str("lyrics"),
-                thinking=p.bool("thinking"),
-                analysis_only=p.bool("analysis_only"),
-                full_analysis_only=p.bool("full_analysis_only"),
-                sample_mode=p.bool("sample_mode"),
-                sample_query=p.str("sample_query"),
-                use_format=p.bool("use_format"),
-                model=p.str("model") or None,
-                bpm=p.int("bpm"),
-                key_scale=p.str("key_scale"),
-                time_signature=p.str("time_signature"),
-                audio_duration=p.float("audio_duration"),
-                vocal_language=p.str("vocal_language", "en"),
-                inference_steps=p.int("inference_steps", 8),
-                guidance_scale=p.float("guidance_scale", 7.0),
-                use_random_seed=p.bool("use_random_seed", True),
-                seed=p.int("seed", -1),
-                batch_size=p.int("batch_size"),
-                repainting_start=p.float("repainting_start", 0.0),
-                repainting_end=p.float("repainting_end"),
-                instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
-                audio_cover_strength=p.float("audio_cover_strength", 1.0),
-                reference_audio_path=ref_audio,
-                src_audio_path=src_audio,
-                task_type=p.str("task_type", "text2music"),
-                use_adg=p.bool("use_adg"),
-                cfg_interval_start=p.float("cfg_interval_start", 0.0),
-                cfg_interval_end=p.float("cfg_interval_end", 1.0),
-                infer_method=p.str("infer_method", "ode"),
-                shift=p.float("shift", 3.0),
-                audio_format=p.str("audio_format", "mp3"),
-                use_tiled_decode=p.bool("use_tiled_decode", True),
-                lm_model_path=p.str("lm_model_path") or None,
-                lm_backend=p.str("lm_backend", "vllm"),
-                lm_temperature=p.float("lm_temperature", LM_DEFAULT_TEMPERATURE),
-                lm_cfg_scale=p.float("lm_cfg_scale", LM_DEFAULT_CFG_SCALE),
-                lm_top_k=p.int("lm_top_k"),
-                lm_top_p=p.float("lm_top_p", LM_DEFAULT_TOP_P),
-                lm_repetition_penalty=p.float("lm_repetition_penalty", 1.0),
-                lm_negative_prompt=p.str("lm_negative_prompt", "NO USER INPUT"),
-                constrained_decoding=p.bool("constrained_decoding", True),
-                constrained_decoding_debug=p.bool("constrained_decoding_debug"),
-                use_cot_caption=p.bool("use_cot_caption", True),
-                use_cot_language=p.bool("use_cot_language", True),
-                is_format_caption=p.bool("is_format_caption"),
-                allow_lm_batch=p.bool("allow_lm_batch", True),
-                track_name=p.str("track_name"),
-                track_classes=t_classes,
-                **kwargs,
-            )
-
-        if content_type.startswith("application/json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            verify_token_from_request(body, authorization)
-
-            # Explicitly validate manual string paths from JSON input
-            p = RequestParser(body)
-            req = _build_request(
-                p,
-                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-            )
-
-        elif content_type.endswith("+json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            verify_token_from_request(body, authorization)
-
-            p = RequestParser(body)
-            req = _build_request(
-                p,
-                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-            )
-
-        elif content_type.startswith("multipart/form-data"):
-            form = await request.form()
-
-            # Parse form data correctly to support lists ---
-            form_dict = {}
-            for k in form.keys():
-                vals = [v for v in form.getlist(k) if not hasattr(v, 'read')]
-                if len(vals) == 1:
-                    form_dict[k] = vals[0]
-                elif len(vals) > 1:
-                    form_dict[k] = vals
-
-            verify_token_from_request(form_dict, authorization)
-
-            # Support both naming conventions: ref_audio/reference_audio, ctx_audio/src_audio
-            ref_up = form.get("ref_audio") or form.get("reference_audio")
-            ctx_up = form.get("ctx_audio") or form.get("src_audio")
-
-            reference_audio_path = None
-            src_audio_path = None
-
-            if isinstance(ref_up, StarletteUploadFile):
-                reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
-                temp_files.append(reference_audio_path)
-            else:
-                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
-
-            if isinstance(ctx_up, StarletteUploadFile):
-                src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
-                temp_files.append(src_audio_path)
-            else:
-                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
-
-            req = _build_request(
-                RequestParser(dict(form_dict)),
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-            )
-
-        elif content_type.startswith("application/x-www-form-urlencoded"):
-            form = await request.form()
-            form_dict = dict(form)
-            verify_token_from_request(form_dict, authorization)
-            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
-            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
-            req = _build_request(
-                RequestParser(form_dict),
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-            )
-
-        else:
-            raw = await request.body()
-            raw_stripped = raw.lstrip()
-            # Best-effort: accept missing/incorrect Content-Type if payload is valid JSON.
-            if raw_stripped.startswith(b"{") or raw_stripped.startswith(b"["):
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                    if isinstance(body, dict):
-                        verify_token_from_request(body, authorization)
-                        p = RequestParser(body)
-                        req = _build_request(
-                            p,
-                            reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                            src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-                        )
-                    else:
-                        raise HTTPException(status_code=400, detail="JSON payload must be an object")
-                except HTTPException:
-                    raise
-                except Exception:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid JSON body (hint: set 'Content-Type: application/json')",
-                    )
-            # Best-effort: parse key=value bodies even if Content-Type is missing.
-            elif raw_stripped and b"=" in raw:
-                parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-                flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
-                verify_token_from_request(flat, authorization)
-                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
-                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
-                req = _build_request(
-                    RequestParser(flat),
-                    reference_audio_path=reference_audio_path,
-                    src_audio_path=src_audio_path,
-                )
-            else:
-                raise HTTPException(
-                    status_code=415,
-                    detail=(
-                        f"Unsupported Content-Type: {content_type or '(missing)'}; "
-                        "use application/json, application/x-www-form-urlencoded, or multipart/form-data"
-                    ),
-                )
-
-        rec = store.create()
-
-        q: asyncio.Queue = app.state.job_queue
-        if q.full():
-            for p in temp_files:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-            raise HTTPException(status_code=429, detail="Server busy: queue is full")
-
-        if temp_files:
-            async with app.state.job_temp_files_lock:
-                app.state.job_temp_files[rec.job_id] = temp_files
-
-        async with app.state.pending_lock:
-            app.state.pending_ids.append(rec.job_id)
-            position = len(app.state.pending_ids)
-
-        await q.put((rec.job_id, req))
-        return _wrap_response({"task_id": rec.job_id, "status": "queued", "queue_position": position})
-
-    @app.post("/query_result")
-    async def query_result(request: Request, authorization: Optional[str] = Header(None)):
-        """Batch query job results"""
-        content_type = (request.headers.get("content-type") or "").lower()
-
-        if "json" in content_type:
-            body = await request.json()
-        else:
-            form = await request.form()
-            body = {k: v for k, v in form.items()}
-
-        verify_token_from_request(body, authorization)
-        task_id_list_str = body.get("task_id_list", "[]")
-
-        # Parse task ID list
-        if isinstance(task_id_list_str, list):
-            task_id_list = task_id_list_str
-        else:
-            try:
-                task_id_list = json.loads(task_id_list_str)
-            except Exception:
-                task_id_list = []
-
-        local_cache = getattr(app.state, 'local_cache', None)
-        data_list = []
-        current_time = time.time()
-
-        for task_id in task_id_list:
-            result_key = f"{RESULT_KEY_PREFIX}{task_id}"
-
-            # Read from local cache first
-            if local_cache:
-                data = local_cache.get(result_key)
-                if data:
-                    try:
-                        data_json = json.loads(data)
-                    except Exception:
-                        data_json = []
-
-                    if len(data_json) <= 0:
-                        data_list.append({"task_id": task_id, "result": data, "status": 2})
-                    else:
-                        status = data_json[0].get("status")
-                        create_time = data_json[0].get("create_time", 0)
-                        if status == 0 and (current_time - create_time) > TASK_TIMEOUT_SECONDS:
-                            data_list.append({"task_id": task_id, "result": data, "status": 2})
-                        else:
-                            data_list.append({
-                                "task_id": task_id,
-                                "result": data,
-                                "status": int(status) if status is not None else 1,
-                                "progress_text": log_buffer.last_message
-                            })
-                    continue
-
-            # Fallback to job_store query
-            rec = store.get(task_id)
-            if rec:
-                env = getattr(rec, 'env', 'development')
-                create_time = rec.created_at
-                status_int = _map_status(rec.status)
-
-                if rec.result and rec.status == "succeeded":
-                    # Check if it's a "Full Analysis" result
-                    if rec.result.get("status_message") == "Full Hardware Analysis Success":
-                         result_data = [rec.result]
-                    else:
-                        audio_paths = rec.result.get("audio_paths", [])
-                        metas = rec.result.get("metas", {}) or {}
-                        result_data = [
-                            {
-                                "file": p, "wave": "", "status": status_int,
-                                "create_time": int(create_time), "env": env,
-                                "prompt": metas.get("caption", ""),
-                                "lyrics": metas.get("lyrics", ""),
-                                "metas": {
-                                    "bpm": metas.get("bpm"),
-                                    "duration": metas.get("duration"),
-                                    "genres": metas.get("genres", ""),
-                                    "keyscale": metas.get("keyscale", ""),
-                                    "timesignature": metas.get("timesignature", ""),
-                                }
-                            }
-                            for p in audio_paths
-                        ] if audio_paths else [{
-                            "file": "", "wave": "", "status": status_int,
-                            "create_time": int(create_time), "env": env,
-                            "prompt": metas.get("caption", ""),
-                            "lyrics": metas.get("lyrics", ""),
-                            "metas": {
-                                "bpm": metas.get("bpm"),
-                                "duration": metas.get("duration"),
-                                "genres": metas.get("genres", ""),
-                                "keyscale": metas.get("keyscale", ""),
-                                "timesignature": metas.get("timesignature", ""),
-                            }
-                        }]
-                else:
-                    result_data = [{
-                        "file": "", "wave": "", "status": status_int,
-                        "create_time": int(create_time), "env": env,
-                        "prompt": "", "lyrics": "",
-                        "metas": {},
-                        "progress": float(rec.progress) if rec else 0.0,
-                        "stage": rec.stage if rec else "queued",
-                        "error": rec.error if rec.error else None,
-                    }]
-
-                current_log = log_buffer.last_message if status_int == 0 else rec.progress_text
-                data_list.append({
-                    "task_id": task_id,
-                    "result": json.dumps(result_data, ensure_ascii=False),
-                    "status": status_int,
-                    "progress_text": current_log
-                })
-            else:
-                data_list.append({"task_id": task_id, "result": "[]", "status": 0})
-
-        return _wrap_response(data_list)
-
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint for service status."""
-        return _wrap_response({
-            "status": "ok",
-            "service": "ACE-Step API",
-            "version": "1.0",
-        })
-
-    @app.get("/v1/stats")
-    async def get_stats(_: None = Depends(verify_api_key)):
-        """Get server statistics including job store stats."""
-        job_stats = store.get_stats()
-        async with app.state.stats_lock:
-            avg_job_seconds = getattr(app.state, "avg_job_seconds", INITIAL_AVG_JOB_SECONDS)
-        return _wrap_response({
-            "jobs": job_stats,
-            "queue_size": app.state.job_queue.qsize(),
-            "queue_maxsize": QUEUE_MAXSIZE,
-            "avg_job_seconds": avg_job_seconds,
-        })
-
-    @app.get("/v1/models")
-    async def list_models(_: None = Depends(verify_api_key)):
-        """List available DiT models."""
-        models = []
-
-        # Primary model (always available if initialized)
-        if getattr(app.state, "_initialized", False):
-            primary_model = _get_model_name(app.state._config_path)
-            if primary_model:
-                models.append({
-                    "name": primary_model,
-                    "is_default": True,
-                })
-
-        # Secondary model
-        if getattr(app.state, "_initialized2", False) and app.state._config_path2:
-            secondary_model = _get_model_name(app.state._config_path2)
-            if secondary_model:
-                models.append({
-                    "name": secondary_model,
-                    "is_default": False,
-                })
-
-        # Third model
-        if getattr(app.state, "_initialized3", False) and app.state._config_path3:
-            third_model = _get_model_name(app.state._config_path3)
-            if third_model:
-                models.append({
-                    "name": third_model,
-                    "is_default": False,
-                })
-
-        return _wrap_response({
-            "models": models,
-            "default_model": models[0]["name"] if models else None,
-        })
-
-    @app.post("/create_random_sample")
-    async def create_random_sample_endpoint(request: Request, authorization: Optional[str] = Header(None)):
-        """
-        Get random sample parameters from pre-loaded example data.
-
-        Returns a random example from the examples directory for form filling.
-        """
-        content_type = (request.headers.get("content-type") or "").lower()
-
-        if "json" in content_type:
-            body = await request.json()
-        else:
-            form = await request.form()
-            body = {k: v for k, v in form.items()}
-
-        verify_token_from_request(body, authorization)
-        sample_type = body.get("sample_type", "simple_mode") or "simple_mode"
-
-        if sample_type == "simple_mode":
-            example_data = SIMPLE_EXAMPLE_DATA
-        else:
-            example_data = CUSTOM_EXAMPLE_DATA
-
-        if not example_data:
-            return _wrap_response(None, code=500, error="No example data available")
-
-        random_example = random.choice(example_data)
-        return _wrap_response(random_example)
-
-    @app.post("/format_input")
-    async def format_input_endpoint(request: Request, authorization: Optional[str] = Header(None)):
-        """
-        Format and enhance lyrics/caption via LLM.
-
-        Takes user-provided caption and lyrics, and uses the LLM to enhance them
-        with proper structure and metadata.
-        """
-        content_type = (request.headers.get("content-type") or "").lower()
-
-        if "json" in content_type:
-            body = await request.json()
-        else:
-            form = await request.form()
-            body = {k: v for k, v in form.items()}
-
-        verify_token_from_request(body, authorization)
-        llm: LLMHandler = app.state.llm_handler
-
-        # Initialize LLM if needed
-        with app.state._llm_init_lock:
-            if not getattr(app.state, "_llm_initialized", False):
-                if getattr(app.state, "_llm_init_error", None):
-                    raise HTTPException(status_code=500, detail=f"LLM init failed: {app.state._llm_init_error}")
-
-                # Check if lazy loading is disabled
-                if getattr(app.state, "_llm_lazy_load_disabled", False):
-                    raise HTTPException(
-                        status_code=503,
-                        detail="LLM not initialized. Set ACESTEP_INIT_LLM=true in .env to enable."
-                    )
-
-                project_root = _get_project_root()
-                checkpoint_dir = os.path.join(project_root, "checkpoints")
-                lm_model_path = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
-                backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-                if backend not in {"vllm", "pt", "mlx"}:
-                    backend = "vllm"
-
-                # Auto-download LM model if not present
-                lm_model_name = _get_model_name(lm_model_path)
-                if lm_model_name:
-                    try:
-                        _ensure_model_downloaded(lm_model_name, checkpoint_dir)
-                    except Exception as e:
-                        print(f"[API Server] Warning: Failed to download LM model {lm_model_name}: {e}")
-
-                lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
-                lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-                status, ok = llm.initialize(
-                    checkpoint_dir=checkpoint_dir,
-                    lm_model_path=lm_model_path,
-                    backend=backend,
-                    device=lm_device,
-                    offload_to_cpu=lm_offload,
-                    dtype=None,
-                )
-                if not ok:
-                    app.state._llm_init_error = status
-                    raise HTTPException(status_code=500, detail=f"LLM init failed: {status}")
-                app.state._llm_initialized = True
-
-        # Parse parameters
-        prompt = body.get("prompt", "") or ""
-        lyrics = body.get("lyrics", "") or ""
-        temperature = _to_float(body.get("temperature"), 0.85)
-
-        # Parse param_obj if provided
-        param_obj_str = body.get("param_obj", "{}")
-        if isinstance(param_obj_str, dict):
-            param_obj = param_obj_str
-        else:
-            try:
-                param_obj = json.loads(param_obj_str) if param_obj_str else {}
-            except json.JSONDecodeError:
-                param_obj = {}
-
-        # Extract metadata from param_obj
-        duration = _to_float(param_obj.get("duration"))
-        bpm = _to_int(param_obj.get("bpm"))
-        key_scale = param_obj.get("key", "") or param_obj.get("key_scale", "") or ""
-        time_signature = param_obj.get("time_signature", "") or body.get("time_signature", "") or ""
-        language = param_obj.get("language", "") or ""
-
-        # Build user_metadata for format_sample
-        user_metadata_for_format = {}
-        if bpm is not None:
-            user_metadata_for_format['bpm'] = bpm
-        if duration is not None and duration > 0:
-            user_metadata_for_format['duration'] = int(duration)
-        if key_scale:
-            user_metadata_for_format['keyscale'] = key_scale
-        if time_signature:
-            user_metadata_for_format['timesignature'] = time_signature
-        if language and language != "unknown":
-            user_metadata_for_format['language'] = language
-
-        # Call format_sample
-        try:
-            format_result = format_sample(
-                llm_handler=llm,
-                caption=prompt,
-                lyrics=lyrics,
-                user_metadata=user_metadata_for_format if user_metadata_for_format else None,
-                temperature=temperature,
-                use_constrained_decoding=True,
-            )
-
-            if not format_result.success:
-                error_msg = format_result.error or format_result.status_message
-                return _wrap_response(None, code=500, error=f"format_sample failed: {error_msg}")
-
-            # Use formatted results or fallback to original
-            result_caption = format_result.caption or prompt
-            result_lyrics = format_result.lyrics or lyrics
-            result_duration = format_result.duration or duration
-            result_bpm = format_result.bpm or bpm
-            result_key_scale = format_result.keyscale or key_scale
-            result_time_signature = format_result.timesignature or time_signature
-
-            return _wrap_response({
-                "caption": result_caption,
-                "lyrics": result_lyrics,
-                "bpm": result_bpm,
-                "key_scale": result_key_scale,
-                "time_signature": result_time_signature,
-                "duration": result_duration,
-                "vocal_language": format_result.language or language or "unknown",
-            })
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"format_sample error: {str(e)}")
-
-    @app.post("/v1/lora/load")
-    async def load_lora_endpoint(request: LoadLoRARequest, _: None = Depends(verify_api_key)):
-        """Load LoRA adapter into the primary model."""
-        handler: AceStepHandler = app.state.handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        try:
-            adapter_name = request.adapter_name.strip() if isinstance(request.adapter_name, str) else None
-            if adapter_name:
-                result = handler.add_lora(request.lora_path, adapter_name=adapter_name)
-            else:
-                result = handler.load_lora(request.lora_path)
-
-            if result.startswith("✅"):
-                response_data = {"message": result, "lora_path": request.lora_path}
-                if adapter_name:
-                    response_data["adapter_name"] = adapter_name
-                return _wrap_response(response_data)
-            else:
-                raise HTTPException(status_code=400, detail=result)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load LoRA: {str(e)}")
-
-    @app.post("/v1/lora/unload")
-    async def unload_lora_endpoint(_: None = Depends(verify_api_key)):
-        """Unload LoRA adapter and restore base model."""
-        handler: AceStepHandler = app.state.handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        try:
-            result = handler.unload_lora()
-
-            if result.startswith("✅") or result.startswith("⚠️"):
-                return _wrap_response({"message": result})
-            else:
-                raise HTTPException(status_code=400, detail=result)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to unload LoRA: {str(e)}")
-
-    @app.post("/v1/lora/toggle")
-    async def toggle_lora_endpoint(request: ToggleLoRARequest, _: None = Depends(verify_api_key)):
-        """Enable or disable LoRA adapter for inference."""
-        handler: AceStepHandler = app.state.handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        try:
-            result = handler.set_use_lora(request.use_lora)
-
-            if result.startswith("✅"):
-                return _wrap_response({"message": result, "use_lora": request.use_lora})
-            else:
-                return _wrap_response(None, code=400, error=result)
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Failed to toggle LoRA: {str(e)}")
-
-    @app.post("/v1/lora/scale")
-    async def set_lora_scale_endpoint(request: SetLoRAScaleRequest, _: None = Depends(verify_api_key)):
-        """Set LoRA adapter scale/strength (0.0-1.0)."""
-        handler: AceStepHandler = app.state.handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        try:
-            adapter_name = request.adapter_name.strip() if isinstance(request.adapter_name, str) else None
-            if adapter_name:
-                result = handler.set_lora_scale(adapter_name, request.scale)
-            else:
-                result = handler.set_lora_scale(request.scale)
-
-            if result.startswith("✅") or result.startswith("⚠️"):
-                response_data = {"message": result, "scale": request.scale}
-                if adapter_name:
-                    response_data["adapter_name"] = adapter_name
-                return _wrap_response(response_data)
-            else:
-                return _wrap_response(None, code=400, error=result)
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Failed to set LoRA scale: {str(e)}")
-
-    @app.get("/v1/lora/status")
-    async def get_lora_status_endpoint(_: None = Depends(verify_api_key)):
-        """Get current LoRA/LoKr adapter state for the primary handler."""
-        handler: AceStepHandler = app.state.handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        status = handler.get_lora_status()
-        return _wrap_response({
-            # Legacy fields for existing clients
-            "lora_loaded": bool(status.get("loaded", getattr(handler, "lora_loaded", False))),
-            "use_lora": bool(status.get("active", getattr(handler, "use_lora", False))),
-            "lora_scale": float(status.get("scale", getattr(handler, "lora_scale", 1.0))),
-            "adapter_type": getattr(handler, "_adapter_type", None),
-            # Extended fields from refactored LoRA service
-            "scales": status.get("scales", {}),
-            "active_adapter": status.get("active_adapter"),
-            "adapters": status.get("adapters", []),
-            "synthetic_default_mode": bool(status.get("synthetic_default_mode", False)),
-        })
-
-    @app.post("/v1/reinitialize")
-    async def reinitialize_service(_: None = Depends(verify_api_key)):
-        """Reinitialize components that were unloaded during training/preprocessing."""
-        handler: AceStepHandler = app.state.handler
-        llm: LLMHandler = app.state.llm_handler
-
-        if handler is None:
-            raise HTTPException(status_code=500, detail="Service not initialized")
-
-        try:
-            import gc
-            reloaded = []
-
-            # Reload full handler stack if critical components were destroyed.
-            # This is the only reliable recovery path from legacy code that set
-            # handler.vae/text_encoder/model.encoder = None.
-            params = getattr(handler, "last_init_params", None) or None
-            if params and (handler.model is None or handler.vae is None or handler.text_encoder is None):
-                status, ok = handler.initialize_service(
-                    project_root=params["project_root"],
-                    config_path=params["config_path"],
-                    device=params["device"],
-                    use_flash_attention=params["use_flash_attention"],
-                    compile_model=params["compile_model"],
-                    offload_to_cpu=params["offload_to_cpu"],
-                    offload_dit_to_cpu=params["offload_dit_to_cpu"],
-                    quantization=params.get("quantization"),
-                    prefer_source=params.get("prefer_source"),
-                    use_mlx_dit=params.get("use_mlx_dit", True),
-                )
-                if ok:
-                    reloaded.append("DiT/VAE/Text Encoder")
-
-            # Reload LLM if needed
-            if llm and not llm.llm_initialized:
-                llm_params = getattr(llm, "last_init_params", None)
-                if llm_params is None:
-                    project_root = _get_project_root()
-                    checkpoint_dir = os.path.join(project_root, "checkpoints")
-                    lm_model_path = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
-                    backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-                    lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
-                    lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-                    llm_params = {
-                        "checkpoint_dir": checkpoint_dir,
-                        "lm_model_path": lm_model_path,
-                        "backend": backend,
-                        "device": lm_device,
-                        "offload_to_cpu": lm_offload,
-                        "dtype": None,
-                    }
-
-                status, ok = llm.initialize(**llm_params)
-                if ok:
-                    reloaded.append("LLM")
-                    try:
-                        app.state._llm_initialized = True
-                        app.state._llm_init_error = None
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        app.state._llm_initialized = False
-                        app.state._llm_init_error = status
-                    except Exception:
-                        pass
-
-            # Reload model components if needed
-            if handler.model is not None:
-                # Check if decoder is on CPU, move to GPU
-                if hasattr(handler.model, 'decoder') and handler.model.decoder is not None:
-                    first_param = next(handler.model.decoder.parameters(), None)
-                    if first_param is not None and first_param.device.type == "cpu":
-                        handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
-                        reloaded.append("Decoder (moved to GPU)")
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            message = "✅ Service reinitialized"
-            if reloaded:
-                message += f"\n🔄 Reloaded: {', '.join(reloaded)}"
-
-            return _wrap_response({"message": message, "reloaded": reloaded})
-
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Reinitialization failed: {str(e)}")
+    register_model_service_routes(
+        app=app,
+        verify_api_key=verify_api_key,
+        wrap_response=_wrap_response,
+        store=store,
+        queue_maxsize=QUEUE_MAXSIZE,
+        initial_avg_job_seconds=INITIAL_AVG_JOB_SECONDS,
+        get_project_root=_get_project_root,
+        get_model_name=_get_model_name,
+        ensure_model_downloaded=_ensure_model_downloaded,
+        env_bool=_env_bool,
+    )
+
+    register_sample_format_routes(
+        app=app,
+        verify_token_from_request=verify_token_from_request,
+        wrap_response=_wrap_response,
+        simple_example_data=SIMPLE_EXAMPLE_DATA,
+        custom_example_data=CUSTOM_EXAMPLE_DATA,
+        format_sample=format_sample,
+        get_project_root=_get_project_root,
+        get_model_name=_get_model_name,
+        ensure_model_downloaded=_ensure_model_downloaded,
+        env_bool=_env_bool,
+        to_int=_to_int,
+        to_float=_to_float,
+    )
+
+    register_lora_routes(
+        app=app,
+        verify_api_key=verify_api_key,
+        wrap_response=_wrap_response,
+    )
+
+    register_reinitialize_route(
+        app=app,
+        verify_api_key=verify_api_key,
+        wrap_response=_wrap_response,
+        env_bool=_env_bool,
+        get_project_root=_get_project_root,
+    )
 
     register_training_api_routes(
         app=app,
@@ -3223,29 +1948,37 @@ def create_app() -> FastAPI:
         append_jsonl=_append_jsonl,
     )
 
-    @app.get("/v1/audio")
-    async def get_audio(path: str, request: Request, _: None = Depends(verify_api_key)):
-        """Serve audio file by path."""
-        from fastapi.responses import FileResponse
+    register_audio_route(
+        app=app,
+        verify_api_key=verify_api_key,
+    )
 
-        # Security: Validate path is within allowed directory to prevent path traversal
-        resolved_path = os.path.realpath(path)
-        allowed_dir = os.path.realpath(request.app.state.temp_audio_dir)
-        if not resolved_path.startswith(allowed_dir + os.sep) and resolved_path != allowed_dir:
-            raise HTTPException(status_code=403, detail="Access denied: path outside allowed directory")
-        if not os.path.exists(resolved_path):
-            raise HTTPException(status_code=404, detail="Audio file not found")
+    register_release_task_route(
+        app=app,
+        verify_token_from_request=verify_token_from_request,
+        wrap_response=_wrap_response,
+        store=store,
+        request_parser_cls=RequestParser,
+        request_model_cls=GenerateMusicRequest,
+        validate_audio_path=_validate_audio_path,
+        save_upload_to_temp=_save_upload_to_temp,
+        upload_file_type=StarletteUploadFile,
+        default_dit_instruction=DEFAULT_DIT_INSTRUCTION,
+        lm_default_temperature=LM_DEFAULT_TEMPERATURE,
+        lm_default_cfg_scale=LM_DEFAULT_CFG_SCALE,
+        lm_default_top_p=LM_DEFAULT_TOP_P,
+    )
 
-        ext = os.path.splitext(resolved_path)[1].lower()
-        media_types = {
-            ".mp3": "audio/mpeg",
-            ".wav": "audio/wav",
-            ".flac": "audio/flac",
-            ".ogg": "audio/ogg",
-        }
-        media_type = media_types.get(ext, "audio/mpeg")
-
-        return FileResponse(resolved_path, media_type=media_type)
+    register_query_result_route(
+        app=app,
+        verify_token_from_request=verify_token_from_request,
+        wrap_response=_wrap_response,
+        store=store,
+        map_status=_map_status,
+        result_key_prefix=RESULT_KEY_PREFIX,
+        task_timeout_seconds=TASK_TIMEOUT_SECONDS,
+        log_buffer=log_buffer,
+    )
 
     return app
 
@@ -3339,3 +2072,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
