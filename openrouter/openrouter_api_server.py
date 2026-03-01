@@ -427,9 +427,6 @@ def _format_lm_content(result: Dict[str, Any]) -> str:
     If LM was used, returns formatted metadata and lyrics.
     Otherwise returns a simple success message.
     """
-    if not result.get("lm_used"):
-        return "Music generated successfully."
-
     metadata = result.get("metadata", {})
     lyrics = result.get("lyrics", "")
 
