@@ -49,9 +49,6 @@ dependencies = [
     "lycoris-lora",
     "lightning>=2.0.0",
     "tensorboard>=2.0.0",
-    # Local third-party packages
-    # nano-vllm source is configured in [tool.uv.sources]
-    "nano-vllm; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "modelscope",
     "tensorboard>=2.20.0",
     "typer-slim>=0.21.1",
@@ -76,7 +73,6 @@ required-environments = [
 ]
 
 [tool.uv.sources]
-nano-vllm = { path = "acestep/third_parts/nano-vllm" }
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
