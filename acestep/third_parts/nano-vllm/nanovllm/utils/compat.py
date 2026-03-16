@@ -5,8 +5,6 @@ unavailable — e.g. on Windows or on GPU architectures where Triton
 has not yet added support (Blackwell / SM 120 as of early 2026).
 """
 
-import functools
-
 from loguru import logger
 
 
